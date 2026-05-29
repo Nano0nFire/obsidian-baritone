@@ -1,69 +1,109 @@
-# setup.sh が生成した .env を読み込む。COMPOSE_PROFILES で同梱サービスを切替。
-# 同梱DB/MinIOを使う場合は profile(bundled-db / bundled-minio)が有効化される。
+# Generated for self-hosted Obsidian Sync. Copy .env.example to .env or run setup.sh.
 services:
   server:
-    build: ../../packages/server      # 実装後の server パッケージを指す（暫定パス）
+    build:
+      context: ..
+      dockerfile: packages/server/Dockerfile
     image: obsidian-sync-server:latest
     restart: unless-stopped
-    env_file: [.env]
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
     ports:
-      - "${SERVER_PORT:-3000}:3000"
+      - "${SERVER_PORT:-3000}:${SERVER_PORT:-3000}"
     depends_on:
-      - postgres
-    # 外部DB/MinIO利用時は depends_on は無視される（プロファイル未起動のため起動順のみ）
+      postgres:
+        condition: service_healthy
+        required: false
+      minio-init:
+        condition: service_completed_successfully
+        required: false
+
+  migrate:
+    image: obsidian-sync-server:latest
+    build:
+      context: ..
+      dockerfile: packages/server/Dockerfile
+    profiles: ["migrate"]
+    restart: "no"
+    env_file:
+      - .env
+    command: ["npm", "run", "migrate", "--workspace", "@obsidian-sync/server"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+      minio-init:
+        condition: service_completed_successfully
+        required: false
 
   postgres:
     image: postgres:16-alpine
     profiles: ["bundled-db"]
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-obsidian_sync}
+      POSTGRES_USER: ${POSTGRES_USER:-obsidian}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME}
     ports:
       - "${PGPORT:-5432}:5432"
     volumes:
       - "${PG_DATA_DIR:-./data/postgres}:/var/lib/postgresql/data"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
 
   minio:
-    image: minio/minio:latest
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
     profiles: ["bundled-minio"]
     restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-CHANGE_ME}
     ports:
       - "${MINIO_PORT:-9000}:9000"
       - "${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - "${MINIO_DATA_DIR:-./data/minio}:/data"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-  # 同梱MinIO利用時にバケットを自動作成
   minio-init:
-    image: minio/mc:latest
+    image: minio/mc:RELEASE.2024-09-16T17-43-14Z
     profiles: ["bundled-minio"]
-    depends_on: [minio]
+    restart: "no"
+    env_file:
+      - .env
+    depends_on:
+      minio:
+        condition: service_healthy
     entrypoint: >
       /bin/sh -c "
-      until (mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}) do sleep 2; done;
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
       mc mb -p local/$${S3_BUCKET} || true;
+      mc anonymous set none local/$${S3_BUCKET};
       "
-    env_file: [.env]
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.8-alpine
     profiles: ["tls-caddy"]
     restart: unless-stopped
-    ports: ["80:80", "443:443"]
+    ports:
+      - "80:80"
+      - "443:443"
     environment:
-      CADDY_DOMAIN: ${CADDY_DOMAIN}
-      CADDY_EMAIL: ${CADDY_EMAIL}
+      CADDY_DOMAIN: ${CADDY_DOMAIN:-}
+      CADDY_EMAIL: ${CADDY_EMAIL:-}
+      SERVER_PORT: ${SERVER_PORT:-3000}
     command: >
-      caddy reverse-proxy --from ${CADDY_DOMAIN} --to server:3000
-    depends_on: [server]
+      caddy reverse-proxy --from ${CADDY_DOMAIN} --to server:${SERVER_PORT:-3000}
+    depends_on:
+      server:
+        condition: service_started

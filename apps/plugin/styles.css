@@ -1,0 +1,19 @@
+.obsidian-sync-conflict {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  margin: 8px 0;
+  padding: 8px;
+}
+.obsidian-sync-badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 2px 8px;
+  margin-top: 4px;
+  background: var(--background-modifier-border);
+  font-size: var(--font-ui-smaller);
+}
+.obsidian-sync-badge.is-open { background: var(--text-warning); color: var(--text-on-accent); }
+.obsidian-sync-badge.is-claimed { background: var(--interactive-accent); color: var(--text-on-accent); }
+.obsidian-sync-merge-modal { width: min(1000px, 90vw); }
+.obsidian-sync-base { width: 100%; min-height: 100px; margin-bottom: 8px; }
+.obsidian-sync-merge-host .cm-mergeView { height: 55vh; overflow: auto; border: 1px solid var(--background-modifier-border); }
