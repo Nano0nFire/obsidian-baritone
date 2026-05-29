@@ -1,0 +1,69 @@
+# setup.sh が生成した .env を読み込む。COMPOSE_PROFILES で同梱サービスを切替。
+# 同梱DB/MinIOを使う場合は profile(bundled-db / bundled-minio)が有効化される。
+services:
+  server:
+    build: ../../packages/server      # 実装後の server パッケージを指す（暫定パス）
+    image: obsidian-sync-server:latest
+    restart: unless-stopped
+    env_file: [.env]
+    ports:
+      - "${SERVER_PORT:-3000}:3000"
+    depends_on:
+      - postgres
+    # 外部DB/MinIO利用時は depends_on は無視される（プロファイル未起動のため起動順のみ）
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["bundled-db"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${PGPORT:-5432}:5432"
+    volumes:
+      - "${PG_DATA_DIR:-./data/postgres}:/var/lib/postgresql/data"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    profiles: ["bundled-minio"]
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - "${MINIO_DATA_DIR:-./data/minio}:/data"
+
+  # 同梱MinIO利用時にバケットを自動作成
+  minio-init:
+    image: minio/mc:latest
+    profiles: ["bundled-minio"]
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "
+      until (mc alias set local http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD}) do sleep 2; done;
+      mc mb -p local/$${S3_BUCKET} || true;
+      "
+    env_file: [.env]
+
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls-caddy"]
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      CADDY_DOMAIN: ${CADDY_DOMAIN}
+      CADDY_EMAIL: ${CADDY_EMAIL}
+    command: >
+      caddy reverse-proxy --from ${CADDY_DOMAIN} --to server:3000
+    depends_on: [server]
