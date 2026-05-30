@@ -1,4 +1,4 @@
-import { Notice, Plugin, TFile, type DataAdapter } from "obsidian";
+import { Modal, Notice, Plugin, TFile, type App, type DataAdapter } from "obsidian";
 import type { Extension } from "@codemirror/state";
 import { ViewPlugin, type EditorView, type PluginValue, type ViewUpdate } from "@codemirror/view";
 import { yCollab } from "y-codemirror.next";
@@ -18,7 +18,7 @@ import { ConflictPanel, VIEW_TYPE_CONFLICTS } from "./conflict/conflict-panel.js
 import { ManualChoiceModal, TextMergeModal, conflictResolvedVV } from "./conflict/merge-view.js";
 import { localConfigIgnorePatterns } from "./configsync/configsync.js";
 import type { VaultIO, VaultFileInfo } from "./sync/vault-io.js";
-import type { ConflictRecord } from "@obsidian-sync/shared";
+import type { ConflictRecord, SnapshotVersionMetadata } from "@obsidian-sync/shared";
 
 const STATE_PATH = ".obsidian/plugins/obsidian-sync/state.json";
 
@@ -206,7 +206,27 @@ export default class ObsidianSyncPlugin extends Plugin {
   private registerCommands(): void {
     this.addCommand({ id: "resync", name: "Resync from server", callback: () => this.engine.requestResync() });
     this.addCommand({ id: "open-conflicts", name: "Open conflicts panel", callback: () => void this.activateConflictsView() });
+    this.addCommand({ id: "show-version-history", name: "Show version history for current note", callback: () => void this.showCurrentNoteHistory() });
     this.addCommand({ id: "pause-resume", name: "Pause/resume sync", callback: async () => { this.settings.paused = !this.settings.paused; if (this.settings.paused) this.engine.pause(); else this.engine.resume(); await this.saveSettingsOnly(); } });
+  }
+
+  private async showCurrentNoteHistory(): Promise<void> {
+    const file = this.app.workspace.getActiveFile();
+    if (!(file instanceof TFile) || file.extension !== "md") {
+      new Notice("Open a synced Markdown note to view history");
+      return;
+    }
+    const entry = this.index.byPath(file.path);
+    if (!entry) {
+      new Notice("This note is not in the sync index yet");
+      return;
+    }
+    const modal = new VersionHistoryModal(this.app, this.yjsManager, entry.fileId, file.path, async (text) => {
+      await this.app.vault.modify(file, text);
+      new Notice("Restored version applied");
+    });
+    modal.open();
+    await modal.load();
   }
 
   private registerVaultEvents(): void {
@@ -333,4 +353,64 @@ export default class ObsidianSyncPlugin extends Plugin {
   }
 
   private setStatus(text: string): void { if (this.statusEl) this.statusEl.setText(`Sync: ${text}`); }
+}
+
+class VersionHistoryModal extends Modal {
+  private selectedVersion: SnapshotVersionMetadata | null = null;
+  private previewEl!: HTMLPreElement;
+  private restoreButton!: HTMLButtonElement;
+
+  constructor(
+    app: App,
+    private readonly yjsManager: YjsSessionManager,
+    private readonly fileId: string,
+    private readonly path: string,
+    private readonly onRestore: (text: string) => Promise<void>,
+  ) { super(app); }
+
+  async load(): Promise<void> {
+    const page = await this.yjsManager.listHistory(this.fileId, { limit: 50 });
+    this.render(page.versions);
+  }
+
+  override onOpen(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `Version history: ${this.path}` });
+    contentEl.createEl("p", { text: "Loading history…" });
+  }
+
+  private render(versions: SnapshotVersionMetadata[]): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl("h2", { text: `Version history: ${this.path}` });
+    const list = contentEl.createEl("div", { cls: "obsidian-sync-history-list" });
+    if (versions.length === 0) list.createEl("p", { text: "No retained versions yet." });
+    for (const version of versions) {
+      const button = list.createEl("button", { text: `${new Date(version.createdAt).toLocaleString()} · ${version.reason} · seq ${version.seq}` });
+      button.addEventListener("click", () => void this.preview(version));
+    }
+    this.previewEl = contentEl.createEl("pre", { cls: "obsidian-sync-history-preview" });
+    this.previewEl.textContent = "Select a version to preview it.";
+    this.restoreButton = contentEl.createEl("button", { text: "Restore selected version" });
+    this.restoreButton.disabled = true;
+    this.restoreButton.addEventListener("click", () => void this.restoreSelected());
+  }
+
+  private async preview(version: SnapshotVersionMetadata): Promise<void> {
+    this.selectedVersion = version;
+    this.restoreButton.disabled = true;
+    this.previewEl.textContent = "Loading preview…";
+    const text = await this.yjsManager.fetchHistoryText(this.fileId, version.versionId);
+    this.previewEl.textContent = text;
+    this.restoreButton.disabled = false;
+  }
+
+  private async restoreSelected(): Promise<void> {
+    if (!this.selectedVersion) return;
+    this.restoreButton.disabled = true;
+    const text = await this.yjsManager.restoreHistoryVersion(this.fileId, this.selectedVersion.versionId);
+    await this.onRestore(text);
+    this.close();
+  }
 }

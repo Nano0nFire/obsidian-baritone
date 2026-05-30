@@ -235,6 +235,47 @@ describe('Yjs Layer 2 room manager', () => {
     expect(textFromSnapshot(room!.snapshot!)).toContain('hello');
   });
 
+
+  it('captures snapshot history on cadence and restores a prior version round-trip', async () => {
+    const { processor, manager, store } = setup({ snapshotEveryUpdates: 2 });
+    await createNote(processor, 'a');
+    const sink = new FakeSink(deviceId);
+    const state = await manager.promote(vaultId, fileId, deviceId, userId, sink);
+
+    const local = new Y.Doc();
+    Y.applyUpdate(local, Buffer.from(state.yjsSnapshot, 'base64'));
+    const localText = local.getText('obsidian');
+    let vector = Y.encodeStateVector(local);
+    localText.delete(0, localText.length); localText.insert(0, 'b');
+    await manager.handleUpdate({ vaultId, fileId, deviceId, userId, roomEpoch: 1, updateId: 1, update: Buffer.from(Y.encodeStateAsUpdate(local, vector)).toString('base64') });
+    vector = Y.encodeStateVector(local);
+    localText.delete(0, localText.length); localText.insert(0, 'c');
+    await manager.handleUpdate({ vaultId, fileId, deviceId, userId, roomEpoch: 1, updateId: 2, update: Buffer.from(Y.encodeStateAsUpdate(local, vector)).toString('base64') });
+
+    const versions = await manager.listHistory(vaultId, fileId, deviceId, userId, { limit: 10 });
+    expect(versions.versions.map((v) => v.seq)).toContain(2);
+    const captured = versions.versions.find((v) => v.seq === 2)!;
+    expect(await manager.getHistoryText(vaultId, fileId, deviceId, userId, captured.versionId)).toBe('c');
+
+    const initial = versions.versions.find((v) => v.seq === 0)!;
+    const restored = await manager.restoreHistoryVersion(vaultId, fileId, deviceId, userId, initial.versionId, '00000000-0000-4000-8000-000000000123');
+    expect(restored.text).toBe('a');
+    const file = (await store.getFile(vaultId, fileId))!;
+    expect(file.contentHash).toBe(await contentHashText('a'));
+  });
+
+  it('enforces history authz: viewers can list/fetch but cannot restore', async () => {
+    const { processor, manager, store } = setup({ snapshotEveryUpdates: 1 });
+    await createNote(processor, 'hello');
+    await manager.promote(vaultId, fileId, deviceId, userId, new FakeSink(deviceId));
+    const version = (await manager.listHistory(vaultId, fileId, deviceId, userId, { limit: 1 })).versions[0]!;
+
+    store.roles.set(store.roleKey(vaultId, userId), 'viewer');
+    await expect(manager.listHistory(vaultId, fileId, deviceId, userId, { limit: 1 })).resolves.toMatchObject({ versions: [expect.objectContaining({ versionId: version.versionId })] });
+    await expect(manager.getHistoryText(vaultId, fileId, deviceId, userId, version.versionId)).resolves.toBe('hello');
+    await expect(manager.restoreHistoryVersion(vaultId, fileId, deviceId, userId, version.versionId, '00000000-0000-4000-8000-000000000124')).rejects.toMatchObject({ code: 'FORBIDDEN' });
+  });
+
   it('rate-limits updates and rejects oversized decoded updates', async () => {
     const { processor, manager } = setup({ updateRateLimit: { maxUpdates: 1, windowMs: 10_000 } });
     await createNote(processor);

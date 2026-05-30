@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import * as Y from 'yjs';
-import { bump, contentHashText, ErrorCode, join, SyncError, type AppliedOp, type FileOp, type RoomClosedReason, type RoomStateMessage, type ServerMessage, type VersionVector } from '@obsidian-sync/shared';
+import { bump, contentHashText, ErrorCode, join, SyncError, type AppliedOp, type FileOp, type ResultingClocks, type RoomClosedReason, type RoomStateMessage, type ServerMessage, type SnapshotVersionMetadata, type VersionVector } from '@obsidian-sync/shared';
 import { OpProcessor } from './op-processor.js';
 import type { Logger } from '../log/logger.js';
 import type { OpDataStore, Role, StoredFile } from './store.js';
@@ -16,6 +16,7 @@ export interface RoomManagerOptions {
   leaseMs?: number;
   closingGraceMs?: number;
   updateRateLimit?: { maxUpdates: number; windowMs: number };
+  snapshotEveryUpdates?: number;
   now?: () => Date;
   broadcastVault?: (vaultId: string, sourceDeviceId: string | null, ops: AppliedOp[]) => void;
   logger?: Logger;
@@ -54,6 +55,7 @@ export class RoomManager {
   private readonly leaseMs: number;
   private readonly closingGraceMs: number;
   private readonly updateRateLimit: { maxUpdates: number; windowMs: number };
+  private readonly snapshotEveryUpdates: number;
   private readonly now: () => Date;
   private readonly broadcastVault: (vaultId: string, sourceDeviceId: string | null, ops: AppliedOp[]) => void;
   private readonly logger?: Logger;
@@ -67,6 +69,7 @@ export class RoomManager {
     this.leaseMs = options.leaseMs ?? 60_000;
     this.closingGraceMs = options.closingGraceMs ?? 3_000;
     this.updateRateLimit = options.updateRateLimit ?? { maxUpdates: 120, windowMs: 10_000 };
+    this.snapshotEveryUpdates = options.snapshotEveryUpdates ?? 20;
     this.now = options.now ?? (() => new Date());
     this.broadcastVault = options.broadcastVault ?? (() => undefined);
     this.logger = options.logger;
@@ -110,6 +113,7 @@ export class RoomManager {
       room.persisted.nextSeq = seq + 1;
       room.persisted.leaseOwner = room.persisted.leaseOwner ?? input.deviceId;
       room.persisted.leaseUntil = new Date(this.now().getTime() + this.leaseMs);
+      if (this.snapshotEveryUpdates > 0 && seq % this.snapshotEveryUpdates === 0) await this.captureSnapshot(room, seq, 'cadence', input.deviceId, input.userId);
       await this.saveRuntime(room);
       participant.sink.send({ t: 'yjs_ack', fileId: input.fileId, roomEpoch: room.persisted.epoch, updateId: input.updateId, seq });
       const relay = { t: 'yjs_update', fileId: input.fileId, roomEpoch: room.persisted.epoch, seq, update: input.update, from: input.deviceId } as ServerMessage;
@@ -201,16 +205,54 @@ export class RoomManager {
     const room = await this.materialize(vaultId, fileId);
     return room.lock.run(async () => {
       const seq = throughSeq ?? Math.max(0, room.persisted.nextSeq - 1);
-      const snapshot = Y.encodeStateAsUpdate(room.doc);
-      const stateVector = Y.encodeStateVector(room.doc);
-      await this.roomStore.saveSnapshot({ vaultId, fileId, roomEpoch: room.persisted.epoch, snapshot, stateVector, compactedThroughSeq: seq, createdAt: this.now() });
+      await this.captureSnapshot(room, seq, 'compact');
       await this.roomStore.deleteUpdatesThrough(vaultId, fileId, room.persisted.epoch, seq);
-      room.persisted.snapshot = snapshot;
-      room.persisted.stateVector = stateVector;
-      room.persisted.compactedThroughSeq = seq;
       await this.saveRuntime(room);
       return seq;
     });
+  }
+
+  async listHistory(vaultId: string, fileId: string, deviceId: string, userId: string, options: { limit?: number; before?: string } = {}): Promise<{ versions: SnapshotVersionMetadata[]; more: boolean }> {
+    await this.requireRole(vaultId, deviceId, userId, false);
+    await this.requiredLiveFile(vaultId, fileId);
+    return this.roomStore.listSnapshotHistory(vaultId, fileId, Math.min(Math.max(options.limit ?? 50, 1), 100), options.before);
+  }
+
+  async getHistoryText(vaultId: string, fileId: string, deviceId: string, userId: string, versionId: string): Promise<string> {
+    await this.requireRole(vaultId, deviceId, userId, false);
+    await this.requiredLiveFile(vaultId, fileId);
+    const version = await this.roomStore.getSnapshotVersion(vaultId, fileId, versionId);
+    if (!version) throw new SyncError(ErrorCode.NOT_FOUND, 'History version not found');
+    return textFromSnapshot(version.snapshot);
+  }
+
+  async restoreHistoryVersion(vaultId: string, fileId: string, deviceId: string, userId: string, versionId: string, requestId: string): Promise<{ text: string; vaultSeq?: number; resultingClocks?: ResultingClocks }> {
+    await this.requireRole(vaultId, deviceId, userId, true);
+    const file = await this.requiredLiveFile(vaultId, fileId);
+    const version = await this.roomStore.getSnapshotVersion(vaultId, fileId, versionId);
+    if (!version) throw new SyncError(ErrorCode.NOT_FOUND, 'History version not found');
+    const text = textFromSnapshot(version.snapshot);
+    const hash = await contentHashText(text);
+    const collabDeviceId = `collab:${fileId}`;
+    const op: FileOp = { opId: requestId, deviceId: collabDeviceId, deviceSeq: deviceSeqFromUuid(requestId), fileId, vaultId, kind: 'update', type: 'note', baseContentVV: file.contentVV, newContentVV: bump(file.contentVV, collabDeviceId), contentHash: hash, inlineText: text, size: new TextEncoder().encode(text).byteLength, schemaVersion: 1 };
+    const result = await this.opProcessor.process(op);
+    if (result.type !== 'ack') throw new SyncError(result.code as ErrorCode, `History restore failed: ${result.message}`, result.details);
+    this.broadcastVault(vaultId, null, [{ vaultSeq: result.vaultSeq, op, resultingClocks: result.resultingClocks }]);
+    const room = await this.materialize(vaultId, fileId);
+    await room.lock.run(async () => {
+      const nextDoc = new Y.Doc();
+      Y.applyUpdate(nextDoc, Y.encodeStateAsUpdate(room.doc));
+      replaceDocText(nextDoc, text);
+      const update = Y.encodeStateAsUpdate(nextDoc, Y.encodeStateVector(room.doc));
+      const seq = room.persisted.nextSeq;
+      await this.roomStore.appendUpdate({ vaultId, fileId, roomEpoch: room.persisted.epoch, seq, deviceId, update, createdAt: this.now() });
+      Y.applyUpdate(room.doc, update);
+      room.persisted.nextSeq = seq + 1;
+      await this.captureSnapshot(room, seq, 'restore', deviceId, userId);
+      await this.saveRuntime(room);
+      this.broadcastRoom(room, { t: 'yjs_update', fileId, roomEpoch: room.persisted.epoch, seq, update: encodeBase64(update) }, false);
+    });
+    return { text, vaultSeq: result.vaultSeq, resultingClocks: result.resultingClocks };
   }
 
   async closeAll(reason: RoomClosedReason = 'evicted'): Promise<void> {
@@ -251,7 +293,7 @@ export class RoomManager {
       compactedThroughSeq: 0,
     };
     await this.saveRuntime(room);
-    await this.roomStore.saveSnapshot({ vaultId: file.vaultId, fileId: file.fileId, roomEpoch: nextEpoch, snapshot: room.persisted.snapshot!, stateVector: room.persisted.stateVector!, compactedThroughSeq: 0, createdAt: now });
+    await this.roomStore.saveSnapshot({ vaultId: file.vaultId, fileId: file.fileId, roomEpoch: nextEpoch, snapshot: room.persisted.snapshot!, stateVector: room.persisted.stateVector!, compactedThroughSeq: 0, createdAt: now, reason: 'activation', deviceId });
   }
 
   private async demoteLocked(room: RuntimeRoom, reason: RoomClosedReason): Promise<string> {
@@ -278,10 +320,8 @@ export class RoomManager {
     const result = await this.opProcessor.process(op);
     if (result.type !== 'ack') throw new SyncError(result.code as ErrorCode, `Collab flush failed: ${result.message}`, result.details);
     this.broadcastVault(room.persisted.vaultId, null, [{ vaultSeq: result.vaultSeq, op, resultingClocks: result.resultingClocks }]);
-    const snapshot = Y.encodeStateAsUpdate(room.doc);
-    const stateVector = Y.encodeStateVector(room.doc);
-    await this.roomStore.saveSnapshot({ vaultId: room.persisted.vaultId, fileId: room.persisted.fileId, roomEpoch: room.persisted.epoch, snapshot, stateVector, compactedThroughSeq: room.persisted.nextSeq - 1, createdAt: this.now() });
-    room.persisted = { ...room.persisted, active: false, leaseOwner: null, leaseUntil: null, snapshot, stateVector, compactedThroughSeq: room.persisted.nextSeq - 1 };
+    await this.captureSnapshot(room, room.persisted.nextSeq - 1, 'demote', room.persisted.leaseOwner ?? undefined);
+    room.persisted = { ...room.persisted, active: false, leaseOwner: null, leaseUntil: null };
     await this.saveRuntime(room);
     const closed: ServerMessage = { t: 'room_closed', fileId: room.persisted.fileId, roomEpoch: room.persisted.epoch, reason, finalHash: hash };
     this.broadcastRoom(room, closed, true);
@@ -338,6 +378,15 @@ export class RoomManager {
     await this.roomStore.saveRoom(room.persisted);
     const file = await this.data.getFile(room.persisted.vaultId, room.persisted.fileId);
     if (file) await this.data.saveFile({ ...file, activeUntil: room.persisted.active ? room.persisted.leaseUntil : null });
+  }
+
+  private async captureSnapshot(room: RuntimeRoom, seq: number, reason: 'activation' | 'cadence' | 'compact' | 'demote' | 'restore', deviceId?: string, userId?: string): Promise<void> {
+    const snapshot = Y.encodeStateAsUpdate(room.doc);
+    const stateVector = Y.encodeStateVector(room.doc);
+    await this.roomStore.saveSnapshot({ vaultId: room.persisted.vaultId, fileId: room.persisted.fileId, roomEpoch: room.persisted.epoch, snapshot, stateVector, compactedThroughSeq: seq, createdAt: this.now(), reason, deviceId, userId });
+    room.persisted.snapshot = snapshot;
+    room.persisted.stateVector = stateVector;
+    room.persisted.compactedThroughSeq = seq;
   }
 
   private scheduleClosingIfEmpty(room: RuntimeRoom): void {
@@ -455,4 +504,21 @@ function errorToRoomMessage(error: unknown): ServerMessage {
 function stableOpId(vaultId: string, fileId: string, epoch: number): string {
   const hex = createHash('sha256').update(`${vaultId}:${fileId}:${epoch}`).digest('hex').slice(0, 12);
   return `00000000-0000-4000-8000-${hex}`;
+}
+
+function deviceSeqFromUuid(value: string): number {
+  const hex = value.replace(/-/g, '').slice(-12);
+  return Math.max(1, Number.parseInt(hex, 16));
+}
+
+function textFromSnapshot(snapshot: Uint8Array): string {
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, snapshot);
+  return doc.getText(TEXT_NAME).toString();
+}
+
+function replaceDocText(doc: Y.Doc, text: string): void {
+  const ytext = doc.getText(TEXT_NAME);
+  if (ytext.length > 0) ytext.delete(0, ytext.length);
+  if (text.length > 0) ytext.insert(0, text);
 }

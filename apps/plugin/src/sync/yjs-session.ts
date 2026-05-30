@@ -1,8 +1,12 @@
 import type {
   ClientMessage,
+  HistoryListResponseMessage,
+  HistoryRestoredMessage,
+  HistoryVersionMessage,
   RoomClosedMessage,
   RoomStateMessage,
   ServerMessage,
+  SnapshotVersionMetadata,
   YjsAckMessage,
   YjsAwarenessRelayMessage,
   YjsRelayUpdateMessage,
@@ -29,6 +33,14 @@ function decodeBase64(data: string): Uint8Array {
   const out = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
   return out;
+}
+
+function randomUuid(): string {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  const hex = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16));
+  hex[12] = "4";
+  hex[16] = ((Number.parseInt(hex[16]!, 16) & 0x3) | 0x8).toString(16);
+  return `${hex.slice(0, 8).join("")}-${hex.slice(8, 12).join("")}-${hex.slice(12, 16).join("")}-${hex.slice(16, 20).join("")}-${hex.slice(20).join("")}`;
 }
 
 interface AckWaiter {
@@ -149,6 +161,31 @@ export class YjsSessionManager {
     const session = this.sessions.get(fileId);
     if (!session) return;
     session.awareness.setLocalState(state);
+  }
+
+  async listHistory(fileId: string, options: { limit?: number; before?: string } = {}): Promise<{ versions: SnapshotVersionMetadata[]; more: boolean }> {
+    const requestId = randomUuid();
+    const response = this.transport.waitFor("history_list", (message: HistoryListResponseMessage) => message.requestId === requestId && message.fileId === fileId, 30_000);
+    this.transport.send({ t: "history_list", requestId, fileId, ...options });
+    const page = await response;
+    return { versions: page.versions, more: page.more };
+  }
+
+  async fetchHistoryText(fileId: string, versionId: string): Promise<string> {
+    const requestId = randomUuid();
+    const response = this.transport.waitFor("history_version", (message: HistoryVersionMessage) => message.requestId === requestId && message.fileId === fileId && message.versionId === versionId, 30_000);
+    this.transport.send({ t: "history_get", requestId, fileId, versionId });
+    return (await response).text;
+  }
+
+  async restoreHistoryVersion(fileId: string, versionId: string): Promise<string> {
+    const requestId = randomUuid();
+    const response = this.transport.waitFor("history_restored", (message: HistoryRestoredMessage) => message.requestId === requestId && message.fileId === fileId && message.versionId === versionId, 30_000);
+    this.transport.send({ t: "history_restore", requestId, fileId, versionId });
+    const restored = await response;
+    const session = this.sessions.get(fileId);
+    if (session) applyMinimalTextDiff(session.text, session.text.toString(), restored.text, YJS_REMOTE_ORIGIN);
+    return restored.text;
   }
 
   async reconcileLayer1Content(fileId: string, text: string, contentHash?: string): Promise<Layer1ReconcileResult> {

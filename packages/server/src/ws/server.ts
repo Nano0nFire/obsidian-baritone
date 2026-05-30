@@ -132,6 +132,20 @@ export class SyncWebSocketServer {
       case 'yjs_sync': await this.rooms.handleSync({ vaultId: state.vaultId!, fileId: msg.fileId, deviceId: state.deviceId!, roomEpoch: msg.roomEpoch, stateVector: msg.stateVector }); break;
       case 'yjs_heartbeat': await this.rooms.heartbeat(state.vaultId!, msg.fileId, state.deviceId!, msg.roomEpoch); break;
       case 'leave_room': await this.rooms.leave(state.vaultId!, msg.fileId, state.deviceId!, msg.roomEpoch); break;
+      case 'history_list': {
+        const page = await this.rooms.listHistory(state.vaultId!, msg.fileId, state.deviceId!, state.claims!.userId, { limit: msg.limit, before: msg.before });
+        send(socket, { t: 'history_list', requestId: msg.requestId, fileId: msg.fileId, versions: page.versions, more: page.more });
+        break;
+      }
+      case 'history_get': {
+        send(socket, { t: 'history_version', requestId: msg.requestId, fileId: msg.fileId, versionId: msg.versionId, text: await this.rooms.getHistoryText(state.vaultId!, msg.fileId, state.deviceId!, state.claims!.userId, msg.versionId) });
+        break;
+      }
+      case 'history_restore': {
+        const restored = await this.rooms.restoreHistoryVersion(state.vaultId!, msg.fileId, state.deviceId!, state.claims!.userId, msg.versionId, msg.requestId);
+        send(socket, { t: 'history_restored', requestId: msg.requestId, fileId: msg.fileId, versionId: msg.versionId, text: restored.text, vaultSeq: restored.vaultSeq, resultingClocks: restored.resultingClocks });
+        break;
+      }
       case 'restore': throw new SyncError(ErrorCode.UNSUPPORTED, 'Use file_op restore so device_seq/idempotency are preserved');
     }
   }
@@ -147,7 +161,7 @@ export class SyncWebSocketServer {
     const claims = await this.tokens.verifyAccess(msg.token);
     if (claims.deviceId !== msg.deviceId || claims.vaultId !== msg.vaultId) throw new SyncError(ErrorCode.UNAUTHENTICATED, 'Token/device/vault mismatch');
     state.claims = claims; state.deviceId = msg.deviceId; state.vaultId = msg.vaultId;
-    send(socket, { t: 'welcome', serverTime: Date.now(), currentSeq: await this.store.currentSeq(msg.vaultId), serverProtocol: PROTOCOL_VERSION, minClientProtocol: MIN_CLIENT_PROTOCOL, capabilities: ['layer1', 'blob-presign', 'manifest-v1', 'conflict-v1', 'yjs-lease-v1', 'yjs-realtime'] });
+    send(socket, { t: 'welcome', serverTime: Date.now(), currentSeq: await this.store.currentSeq(msg.vaultId), serverProtocol: PROTOCOL_VERSION, minClientProtocol: MIN_CLIENT_PROTOCOL, capabilities: ['layer1', 'blob-presign', 'manifest-v1', 'conflict-v1', 'yjs-lease-v1', 'yjs-realtime', 'snapshot-history-v1'] });
     const ops = await this.store.listOps(msg.vaultId, msg.lastSeq, 1000);
     if (ops.length) send(socket, { t: 'ops', ops, more: ops.length === 1000 });
   }

@@ -41,16 +41,17 @@ describe.skipIf(!integrationReady)('server integration: postgres, minio, and Lay
     await db?.close();
   });
 
-  it('runs migrations and records 001+002 idempotently', async () => {
+  it('runs migrations and records 001+002+003 idempotently', async () => {
+    const expected = ['001_initial', '002_yjs_layer2', '003_snapshot_history'];
     const first = await migrate(db);
-    expect(first).toEqual(['001_initial', '002_yjs_layer2']);
+    expect(first).toEqual(expected);
 
     const rows = (await db.query<{ version: string }>('SELECT version FROM schema_migrations ORDER BY version')).rows;
-    expect(rows.map((row) => row.version)).toEqual(['001_initial', '002_yjs_layer2']);
+    expect(rows.map((row) => row.version)).toEqual(expected);
 
     await expect(migrate(db)).resolves.toEqual([]);
     const count = (await db.query<{ count: string }>('SELECT count(*) FROM schema_migrations')).rows[0]?.count;
-    expect(Number(count)).toBe(2);
+    expect(Number(count)).toBe(expected.length);
   });
 
   it('round-trips PgOpDataStore ops, manifest, content, ordering, and conflicts', async () => {

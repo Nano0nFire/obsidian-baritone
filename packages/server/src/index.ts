@@ -11,6 +11,7 @@ import { ConflictService } from './engine/conflict.js';
 import { ManifestService } from './engine/manifest.js';
 import { TrashService } from './engine/trash.js';
 import { PgYjsRoomStore } from './engine/yjs.js';
+import { YjsGcJob } from './engine/yjs-gc.js';
 import { RoomManager } from './engine/room-manager.js';
 import { SyncWebSocketServer } from './ws/server.js';
 import { FixedWindowRateLimiter } from './ws/rate-limit.js';
@@ -66,12 +67,16 @@ export async function startServer(): Promise<{ close(): Promise<void> }> {
   const conflicts = new ConflictService(data);
   const manifest = new ManifestService(data);
   const trash = new TrashService(data, opProcessor, config.TRASH_RETENTION_DAYS);
+  const yjsStore = new PgYjsRoomStore(db);
   const wsRef: { current?: SyncWebSocketServer } = {};
-  const rooms = new RoomManager(data, new PgYjsRoomStore(db), opProcessor, {
+  const rooms = new RoomManager(data, yjsStore, opProcessor, {
     updateRateLimit: { maxUpdates: config.YJS_UPDATE_RATE_LIMIT_MAX, windowMs: config.YJS_UPDATE_RATE_LIMIT_WINDOW_MS },
+    snapshotEveryUpdates: config.YJS_SNAPSHOT_EVERY_UPDATES,
     broadcastVault: (vaultId, _sourceDeviceId, ops) => wsRef.current?.broadcastOps(vaultId, null, ops),
     logger: logger.child({ component: 'rooms' }),
   });
+  const yjsGc = new YjsGcJob(yjsStore, { retainedVersionsPerFile: config.YJS_HISTORY_RETAINED_VERSIONS, intervalMs: config.YJS_HISTORY_GC_INTERVAL_MS, logger: logger.child({ component: 'yjs-gc' }) });
+  yjsGc.start();
 
   const server = http.createServer(createHttpHandler({ db, ws: { isReady: () => !closing && (wsRef.current?.isReady() ?? false) } }));
   const ws = new SyncWebSocketServer(server, data, tokens, opProcessor, conflicts, manifest, trash, blobStore, rooms, {
@@ -89,6 +94,7 @@ export async function startServer(): Promise<{ close(): Promise<void> }> {
       logger.info('server shutdown started', { event: 'server_shutdown_started', timeoutMs: config.SHUTDOWN_TIMEOUT_MS });
       await withTimeout((async () => {
         await ws.close(config.SHUTDOWN_TIMEOUT_MS);
+        await yjsGc.stop();
         await rooms.closeAll('evicted');
         await closeHttpServer(server);
         await db.close();

@@ -147,6 +147,23 @@ export interface YjsHeartbeatMessage { t: 'yjs_heartbeat'; fileId: string; roomE
 /** Leave the room; server may begin closing if no participants remain. */
 export interface LeaveRoomMessage { t: 'leave_room'; fileId: string; roomEpoch: number }
 
+export type SnapshotHistoryReason = 'activation' | 'cadence' | 'compact' | 'demote' | 'restore';
+
+export interface SnapshotVersionMetadata {
+  versionId: string;
+  fileId: string;
+  roomEpoch: number;
+  seq: number;
+  createdAt: number;
+  reason: SnapshotHistoryReason;
+  deviceId?: string;
+  userId?: string;
+}
+
+export interface HistoryListMessage { t: 'history_list'; requestId: string; fileId: string; limit?: number; before?: string }
+export interface HistoryGetMessage { t: 'history_get'; requestId: string; fileId: string; versionId: string }
+export interface HistoryRestoreMessage { t: 'history_restore'; requestId: string; fileId: string; versionId: string }
+
 export interface BlobUploadInitMessage {
   t: 'blob_upload_init';
   fileId?: string;
@@ -184,6 +201,9 @@ export type ClientMessage =
   | YjsSyncMessage
   | YjsHeartbeatMessage
   | LeaveRoomMessage
+  | HistoryListMessage
+  | HistoryGetMessage
+  | HistoryRestoreMessage
   | BlobUploadInitMessage
   | BlobUploadCompleteMessage
   | ClaimConflictMessage
@@ -316,6 +336,32 @@ export interface TrashListMessage {
   items: Array<{ fileId: string; path: string; deletedAt: number; size: number | null }>;
 }
 
+export interface HistoryListResponseMessage {
+  t: 'history_list';
+  requestId: string;
+  fileId: string;
+  versions: SnapshotVersionMetadata[];
+  more: boolean;
+}
+
+export interface HistoryVersionMessage {
+  t: 'history_version';
+  requestId: string;
+  fileId: string;
+  versionId: string;
+  text: string;
+}
+
+export interface HistoryRestoredMessage {
+  t: 'history_restored';
+  requestId: string;
+  fileId: string;
+  versionId: string;
+  text: string;
+  vaultSeq?: number;
+  resultingClocks?: ResultingClocks;
+}
+
 export interface ErrorMessage {
   t: 'error';
   code: string;
@@ -347,5 +393,8 @@ export type ServerMessage =
   | ManifestPageMessage
   | ContentMessage
   | TrashListMessage
+  | HistoryListResponseMessage
+  | HistoryVersionMessage
+  | HistoryRestoredMessage
   | ErrorMessage
   | RejectMessage;

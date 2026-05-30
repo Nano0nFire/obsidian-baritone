@@ -21,6 +21,9 @@ const EnvSchema = z.object({
   WS_MESSAGE_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1000).max(86_400_000).default(10_000),
   YJS_UPDATE_RATE_LIMIT_MAX: z.coerce.number().int().min(1).max(100_000).default(120),
   YJS_UPDATE_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().min(1000).max(86_400_000).default(10_000),
+  YJS_SNAPSHOT_EVERY_UPDATES: z.coerce.number().int().min(0).max(100_000).default(20),
+  YJS_HISTORY_RETAINED_VERSIONS: z.coerce.number().int().min(1).max(10_000).default(100),
+  YJS_HISTORY_GC_INTERVAL_MS: z.coerce.number().int().min(0).max(86_400_000).default(3_600_000),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(15_000),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
 });

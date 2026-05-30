@@ -208,6 +208,29 @@ describe("YjsSessionManager", () => {
     // The carried-forward local edit is re-sent under the new epoch.
     expect(transport.sent.some((m) => m.t === "yjs_update" && m.roomEpoch === 2)).toBe(true);
   });
+
+  it('requests history list, fetch, and restore messages and resolves matching responses', async () => {
+    const transport = new FakeTransport();
+    const manager = new YjsSessionManager(transport as unknown as SyncTransport);
+
+    const listPromise = manager.listHistory('file-1', { limit: 5 });
+    const listRequest = transport.sent.at(-1);
+    expect(listRequest).toMatchObject({ t: 'history_list', fileId: 'file-1', limit: 5 });
+    await transport.deliver({ t: 'history_list', requestId: (listRequest as { requestId: string }).requestId, fileId: 'file-1', versions: [{ versionId: 'v1', fileId: 'file-1', roomEpoch: 1, seq: 0, createdAt: 1, reason: 'activation' }], more: false });
+    await expect(listPromise).resolves.toMatchObject({ versions: [expect.objectContaining({ versionId: 'v1' })] });
+
+    const fetchPromise = manager.fetchHistoryText('file-1', 'v1');
+    const fetchRequest = transport.sent.at(-1);
+    expect(fetchRequest).toMatchObject({ t: 'history_get', fileId: 'file-1', versionId: 'v1' });
+    await transport.deliver({ t: 'history_version', requestId: (fetchRequest as { requestId: string }).requestId, fileId: 'file-1', versionId: 'v1', text: 'old text' });
+    await expect(fetchPromise).resolves.toBe('old text');
+
+    const restorePromise = manager.restoreHistoryVersion('file-1', 'v1');
+    const restoreRequest = transport.sent.at(-1);
+    expect(restoreRequest).toMatchObject({ t: 'history_restore', fileId: 'file-1', versionId: 'v1' });
+    await transport.deliver({ t: 'history_restored', requestId: (restoreRequest as { requestId: string }).requestId, fileId: 'file-1', versionId: 'v1', text: 'old text' });
+    await expect(restorePromise).resolves.toBe('old text');
+  });
 });
 
 describe("threeWayMerge", () => {
