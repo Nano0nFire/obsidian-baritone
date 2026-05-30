@@ -5,7 +5,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ENV_FILE="${SCRIPT_DIR}/.env"
+ENV_FILE="${SETUP_ENV_FILE:-${SCRIPT_DIR}/.env}"
 NONINTERACTIVE="${SETUP_NONINTERACTIVE:-0}"
 
 c_info(){ printf '\033[36m%s\033[0m\n' "$*"; }
@@ -60,7 +60,20 @@ if [ "$SKIP_CONFIG" != "1" ]; then
   ask SERVER_PORT "Public HTTP/WebSocket port" "3000"
   ask PUBLIC_URL "Public URL used by clients" "http://localhost:${SERVER_PORT}"
   ask TRASH_RETENTION_DAYS "Server trash retention days" "30"
+  ask LOG_LEVEL "Log level (debug/info/warn/error)" "info"
+  ask SHUTDOWN_TIMEOUT_MS "Graceful shutdown timeout ms" "15000"
   ask COMPOSE_PROJECT_NAME "Compose project/container prefix" "obsidian-sync"
+
+  c_info "=== Rate limiting ==="
+  ask AUTH_RATE_LIMIT_MAX_FAILURES "Auth failures before lockout" "5"
+  ask AUTH_RATE_LIMIT_WINDOW_MS "Auth failure window ms" "60000"
+  ask AUTH_RATE_LIMIT_LOCKOUT_MS "Auth lockout ms" "300000"
+  ask WS_CONNECTION_RATE_LIMIT_MAX "WebSocket connections per IP per window" "30"
+  ask WS_CONNECTION_RATE_LIMIT_WINDOW_MS "WebSocket connection window ms" "60000"
+  ask WS_MESSAGE_RATE_LIMIT_MAX "WebSocket messages per connection per window" "120"
+  ask WS_MESSAGE_RATE_LIMIT_WINDOW_MS "WebSocket message window ms" "10000"
+  ask YJS_UPDATE_RATE_LIMIT_MAX "Yjs updates per room participant per window" "120"
+  ask YJS_UPDATE_RATE_LIMIT_WINDOW_MS "Yjs update window ms" "10000"
 
   c_info "=== TLS ==="
   ask_choice TLS_MODE "TLS mode:" "none" "caddy"
@@ -134,7 +147,19 @@ COMPOSE_PROFILES=${COMPOSE_PROFILES}
 SERVER_PORT=${SERVER_PORT}
 PUBLIC_URL=${PUBLIC_URL}
 TRASH_RETENTION_DAYS=${TRASH_RETENTION_DAYS}
+LOG_LEVEL=${LOG_LEVEL}
+SHUTDOWN_TIMEOUT_MS=${SHUTDOWN_TIMEOUT_MS}
 JWT_SECRET=${JWT_SECRET}
+
+AUTH_RATE_LIMIT_MAX_FAILURES=${AUTH_RATE_LIMIT_MAX_FAILURES}
+AUTH_RATE_LIMIT_WINDOW_MS=${AUTH_RATE_LIMIT_WINDOW_MS}
+AUTH_RATE_LIMIT_LOCKOUT_MS=${AUTH_RATE_LIMIT_LOCKOUT_MS}
+WS_CONNECTION_RATE_LIMIT_MAX=${WS_CONNECTION_RATE_LIMIT_MAX}
+WS_CONNECTION_RATE_LIMIT_WINDOW_MS=${WS_CONNECTION_RATE_LIMIT_WINDOW_MS}
+WS_MESSAGE_RATE_LIMIT_MAX=${WS_MESSAGE_RATE_LIMIT_MAX}
+WS_MESSAGE_RATE_LIMIT_WINDOW_MS=${WS_MESSAGE_RATE_LIMIT_WINDOW_MS}
+YJS_UPDATE_RATE_LIMIT_MAX=${YJS_UPDATE_RATE_LIMIT_MAX}
+YJS_UPDATE_RATE_LIMIT_WINDOW_MS=${YJS_UPDATE_RATE_LIMIT_WINDOW_MS}
 
 DB_MODE=${DB_MODE}
 DATABASE_URL=${DATABASE_URL}
@@ -183,7 +208,9 @@ if [ "${DB_MODE:-}" = "external" ]; then
   fi
 fi
 
-ask DOUP "Build, migrate, bootstrap admin, and start now? (y/n)" "y"
+DOUP_DEFAULT="y"
+[ "$NONINTERACTIVE" = "1" ] && DOUP_DEFAULT="n"
+ask DOUP "Build, migrate, bootstrap admin, and start now? (y/n)" "$DOUP_DEFAULT"
 if [ "$DOUP" = "y" ]; then
   c_info "Building server image from repository root: $REPO_ROOT"
   compose build server

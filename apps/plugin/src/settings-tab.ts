@@ -1,6 +1,6 @@
 import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type ObsidianSyncPlugin from "./main.js";
-import type { ConfigCategory } from "./settings.js";
+import { CONFIG_CATEGORIES, type ConfigSyncMode } from "./settings.js";
 
 function httpFromWs(url: string): string {
   if (url.startsWith("ws://")) return `http://${url.slice(5)}`;
@@ -43,15 +43,6 @@ class LoginModal extends Modal {
   }
 }
 
-const CATEGORY_LABELS: Record<ConfigCategory, string> = {
-  app: "App settings",
-  corePlugins: "Core plugins",
-  communityPlugins: "Community plugin binaries",
-  pluginSettings: "Plugin settings",
-  themesSnippets: "Themes and snippets",
-  workspace: "Workspace layout",
-};
-
 export class ObsidianSyncSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: ObsidianSyncPlugin) { super(app, plugin); }
 
@@ -66,11 +57,51 @@ export class ObsidianSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Remote deletes").setDesc("Where files deleted by remote ops are moved locally.").addDropdown((drop) => drop.addOption("obsidian-trash", "Obsidian .trash").addOption("system-trash", "System trash").setValue(this.plugin.settings.remoteDeleteTarget).onChange(async (value) => { this.plugin.settings.remoteDeleteTarget = value as typeof this.plugin.settings.remoteDeleteTarget; await this.plugin.saveSettingsOnly(); }));
     new Setting(containerEl).setName("Pause sync").addToggle((toggle) => toggle.setValue(this.plugin.settings.paused).onChange(async (value) => { this.plugin.settings.paused = value; await this.plugin.saveSettingsAndRestart(); }));
     containerEl.createEl("h3", { text: "Config sync" });
-    for (const key of Object.keys(CATEGORY_LABELS) as ConfigCategory[]) {
-      new Setting(containerEl).setName(CATEGORY_LABELS[key]).addDropdown((drop) => drop.addOption("common", "Common").addOption("local", "Local only").setValue(this.plugin.settings.configSync[key]).onChange(async (value) => { this.plugin.settings.configSync[key] = value as "common" | "local"; await this.plugin.saveSettingsOnly(); }));
+    containerEl.createEl("p", {
+      text: "Choose whether each Obsidian configuration category uses the shared COMMON settings or remains DEVICE-LOCAL on this client.",
+      cls: "setting-item-description",
+    });
+    for (const category of CONFIG_CATEGORIES) {
+      new Setting(containerEl)
+        .setName(category.label)
+        .setDesc(category.description)
+        .addDropdown((drop) => drop
+          .addOption("common", "COMMON synced settings")
+          .addOption("local", "DEVICE-LOCAL settings")
+          .setValue(this.plugin.settings.configSync[category.key])
+          .onChange(async (value) => {
+            this.plugin.settings.configSync[category.key] = value as ConfigSyncMode;
+            await this.plugin.saveSettingsOnly();
+          }));
     }
-    containerEl.createEl("h3", { text: ".ignore" });
-    new Setting(containerEl).setName("Common ignore rules").setDesc("Synced layer. Gitignore syntax subset.").addTextArea((text) => { text.inputEl.rows = 6; text.setValue(this.plugin.settings.commonIgnore).onChange(async (value) => { this.plugin.settings.commonIgnore = value; await this.plugin.saveSettingsAndRestart(); }); });
-    new Setting(containerEl).setName("Local ignore rules").setDesc("Device-local layer.").addTextArea((text) => { text.inputEl.rows = 6; text.setValue(this.plugin.settings.localIgnore).onChange(async (value) => { this.plugin.settings.localIgnore = value; await this.plugin.saveSettingsAndRestart(); }); });
+    containerEl.createEl("h3", { text: ".ignore rules" });
+    containerEl.createEl("p", {
+      text: "Add gitignore-like rules for files that must not sync. Later negated rules beginning with ! can re-include files.",
+      cls: "setting-item-description",
+    });
+    new Setting(containerEl)
+      .setName("Common .ignore")
+      .setDesc("Synced to every client. Use for project-wide exclusions such as generated folders or secrets.")
+      .addTextArea((text) => {
+        text.inputEl.rows = 8;
+        text.inputEl.addClass("obsidian-sync-ignore-editor");
+        text.setPlaceholder("# Synced exclusions\nbuild/\n*.secret\n!important.secret");
+        text.setValue(this.plugin.settings.commonIgnore).onChange(async (value) => {
+          this.plugin.settings.commonIgnore = value;
+          await this.plugin.saveSettingsAndRestart();
+        });
+      });
+    new Setting(containerEl)
+      .setName("Device-local .ignore")
+      .setDesc("Stored only on this device. Use for machine-specific paths or temporary exports.")
+      .addTextArea((text) => {
+        text.inputEl.rows = 8;
+        text.inputEl.addClass("obsidian-sync-ignore-editor");
+        text.setPlaceholder("# Local-only exclusions\nexports/\nScratch/");
+        text.setValue(this.plugin.settings.localIgnore).onChange(async (value) => {
+          this.plugin.settings.localIgnore = value;
+          await this.plugin.saveSettingsAndRestart();
+        });
+      });
   }
 }

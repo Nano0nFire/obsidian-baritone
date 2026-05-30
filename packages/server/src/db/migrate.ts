@@ -2,6 +2,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadConfig } from '../config.js';
+import { createLogger, parseLogLevel } from '../log/logger.js';
 import { PgDatabase } from './pool.js';
 
 export async function migrate(db: PgDatabase): Promise<string[]> {
@@ -28,11 +29,11 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const db = new PgDatabase(config.DATABASE_URL);
   migrate(db)
     .then((applied) => {
-      console.log(JSON.stringify({ applied }));
+      process.stdout.write(`${JSON.stringify({ applied })}\n`);
     })
     .finally(() => db.close())
     .catch((error) => {
-      console.error(error instanceof Error ? error.message : error);
+      createLogger({ level: parseLogLevel(process.env.LOG_LEVEL) }).error('database migration failed', { event: 'database_migration_failed', error });
       process.exitCode = 1;
     });
 }

@@ -2,6 +2,21 @@ export type RemoteDeleteTarget = "obsidian-trash" | "system-trash";
 export type ConfigCategory = "app" | "corePlugins" | "communityPlugins" | "pluginSettings" | "themesSnippets" | "workspace";
 export type ConfigSyncMode = "common" | "local";
 
+export interface ConfigCategoryInfo {
+  key: ConfigCategory;
+  label: string;
+  description: string;
+}
+
+export const CONFIG_CATEGORIES: readonly ConfigCategoryInfo[] = [
+  { key: "app", label: "App settings", description: "app.json, appearance.json, and hotkeys.json." },
+  { key: "corePlugins", label: "Core plugins", description: "Obsidian's core plugin enablement list." },
+  { key: "communityPlugins", label: "Community plugins", description: "Community plugin enablement plus plugin manifest, main.js, and styles.css files." },
+  { key: "pluginSettings", label: "Plugin settings", description: "Per-plugin data.json settings files." },
+  { key: "themesSnippets", label: "Themes and snippets", description: "Files under .obsidian/themes and .obsidian/snippets." },
+  { key: "workspace", label: "Workspace layout", description: "workspace*.json layout state. Usually best kept device-local." },
+] as const;
+
 export interface PluginSettings {
   serverUrl: string;
   vaultId: string;

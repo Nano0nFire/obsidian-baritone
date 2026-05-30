@@ -17,3 +17,68 @@
 .obsidian-sync-merge-modal { width: min(1000px, 90vw); }
 .obsidian-sync-base { width: 100%; min-height: 100px; margin-bottom: 8px; }
 .obsidian-sync-merge-host .cm-mergeView { height: 55vh; overflow: auto; border: 1px solid var(--background-modifier-border); }
+.obsidian-sync-ignore-editor { width: 100%; font-family: var(--font-monospace); }
+
+.obsidian-sync-presence {
+  align-items: center;
+  display: inline-flex;
+  gap: 6px;
+  max-width: min(42vw, 520px);
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.obsidian-sync-presence-prefix {
+  color: var(--text-muted);
+}
+
+.obsidian-sync-presence-chip {
+  align-items: center;
+  background: var(--background-modifier-hover);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 999px;
+  display: inline-flex;
+  gap: 4px;
+  min-width: 0;
+  padding: 1px 7px 1px 5px;
+}
+
+.obsidian-sync-presence-chip.is-local {
+  background: var(--background-modifier-form-field);
+}
+
+.obsidian-sync-presence-chip.is-idle {
+  opacity: 0.68;
+}
+
+.obsidian-sync-presence-dot {
+  border: 1px solid var(--background-primary);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px var(--background-modifier-border);
+  flex: 0 0 auto;
+  height: 0.65em;
+  width: 0.65em;
+}
+
+.obsidian-sync-presence-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cm-ySelection {
+  border-radius: 2px;
+}
+
+.cm-ySelectionCaret {
+  filter: drop-shadow(0 0 1px var(--background-primary));
+  min-height: 1.1em;
+}
+
+.cm-ySelectionInfo {
+  border-radius: 4px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+  font-family: var(--font-interface);
+  font-size: var(--font-ui-smaller);
+  letter-spacing: 0.01em;
+  padding: 2px 6px;
+}

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import * as Y from 'yjs';
 import { bump, contentHashText, ErrorCode, join, SyncError, type AppliedOp, type FileOp, type RoomClosedReason, type RoomStateMessage, type ServerMessage, type VersionVector } from '@obsidian-sync/shared';
 import { OpProcessor } from './op-processor.js';
+import type { Logger } from '../log/logger.js';
 import type { OpDataStore, Role, StoredFile } from './store.js';
 import type { PersistedYjsRoom, StoredYjsUpdate, YjsRoomStore } from './yjs.js';
 
@@ -17,6 +18,7 @@ export interface RoomManagerOptions {
   updateRateLimit?: { maxUpdates: number; windowMs: number };
   now?: () => Date;
   broadcastVault?: (vaultId: string, sourceDeviceId: string | null, ops: AppliedOp[]) => void;
+  logger?: Logger;
 }
 
 interface Participant {
@@ -54,6 +56,7 @@ export class RoomManager {
   private readonly updateRateLimit: { maxUpdates: number; windowMs: number };
   private readonly now: () => Date;
   private readonly broadcastVault: (vaultId: string, sourceDeviceId: string | null, ops: AppliedOp[]) => void;
+  private readonly logger?: Logger;
 
   constructor(
     private readonly data: OpDataStore,
@@ -66,6 +69,7 @@ export class RoomManager {
     this.updateRateLimit = options.updateRateLimit ?? { maxUpdates: 120, windowMs: 10_000 };
     this.now = options.now ?? (() => new Date());
     this.broadcastVault = options.broadcastVault ?? (() => undefined);
+    this.logger = options.logger;
   }
 
   async promote(vaultId: string, fileId: string, deviceId: string, userId: string, sink: RoomSink): Promise<RoomStateMessage> {
@@ -209,6 +213,20 @@ export class RoomManager {
     });
   }
 
+  async closeAll(reason: RoomClosedReason = 'evicted'): Promise<void> {
+    await Promise.all([...this.rooms.values()].map((room) => room.lock.run(async () => {
+      if (room.closingTimer) clearTimeout(room.closingTimer);
+      room.closingTimer = undefined;
+      if (!room.persisted.active) return;
+      try {
+        await this.demoteLocked(room, reason);
+      } catch (error) {
+        this.logger?.error('room close failed', { event: 'room_close_failed', vaultId: room.persisted.vaultId, fileId: room.persisted.fileId, error });
+        this.broadcastRoom(room, errorToRoomMessage(error), true);
+      }
+    })));
+  }
+
   private async activate(room: RuntimeRoom, file: StoredFile, deviceId: string, now: Date): Promise<void> {
     const nextEpoch = room.persisted.seeded ? room.persisted.epoch + 1 : Math.max(1, room.persisted.epoch + 1);
     room.doc = new Y.Doc();
@@ -332,6 +350,7 @@ export class RoomManager {
           if (room.participants.size === 0 && room.persisted.active) await this.demoteLocked(room, 'demoted');
         } catch (error) {
           room.state = 'active';
+          this.logger?.error('scheduled room close failed', { event: 'room_scheduled_close_failed', vaultId: room.persisted.vaultId, fileId: room.persisted.fileId, error });
           this.broadcastRoom(room, errorToRoomMessage(error), true);
         }
       });

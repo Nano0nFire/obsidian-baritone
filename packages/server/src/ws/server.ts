@@ -1,6 +1,8 @@
 import http from 'node:http';
 import WebSocket, { WebSocketServer } from 'ws';
 import { ErrorCode, MIN_CLIENT_PROTOCOL, PROTOCOL_VERSION, SyncError, type AppliedOp, type ServerMessage } from '@obsidian-sync/shared';
+import type { Logger } from '../log/logger.js';
+import { FixedWindowRateLimiter } from './rate-limit.js';
 import type { BlobStore } from '../blob/store.js';
 import { TokenService, type AccessClaims } from '../auth/tokens.js';
 import { OpProcessor } from '../engine/op-processor.js';
@@ -11,11 +13,21 @@ import { RoomManager, type RoomSink } from '../engine/room-manager.js';
 import type { OpDataStore } from '../engine/store.js';
 import { clientMessageSchema, type ValidatedClientMessage } from './validation.js';
 
-interface ConnectionState { claims?: AccessClaims; vaultId?: string; deviceId?: string; queue?: Promise<void> }
+interface ConnectionState { claims?: AccessClaims; vaultId?: string; deviceId?: string; queue?: Promise<void>; messageLimiter: FixedWindowRateLimiter }
+
+export interface SyncWebSocketServerOptions {
+  connectionLimiter?: FixedWindowRateLimiter;
+  messageLimiterFactory?: () => FixedWindowRateLimiter;
+  logger?: Logger;
+}
 
 export class SyncWebSocketServer {
   readonly wss: WebSocketServer;
   private readonly clients = new Set<{ socket: WebSocket; state: ConnectionState }>();
+  private accepting = true;
+  private readonly messageLimiterFactory: () => FixedWindowRateLimiter;
+  private readonly logger?: Logger;
+
   constructor(
     server: http.Server,
     private readonly store: OpDataStore,
@@ -26,27 +38,52 @@ export class SyncWebSocketServer {
     private readonly trash: TrashService,
     private readonly blobs: BlobStore,
     private readonly rooms: RoomManager,
+    private readonly options: SyncWebSocketServerOptions = {},
   ) {
-    this.wss = new WebSocketServer({ server });
+    this.wss = new WebSocketServer({ noServer: true });
+    this.messageLimiterFactory = options.messageLimiterFactory ?? (() => new FixedWindowRateLimiter({ max: 120, windowMs: 10_000 }));
+    this.logger = options.logger;
+    server.on('upgrade', (request, socket, head) => {
+      const ip = clientIp(request);
+      const allowed = this.accepting && (!options.connectionLimiter || options.connectionLimiter.consume(ip).allowed);
+      if (!allowed) {
+        socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{"error":"RATE_LIMITED"}');
+        socket.destroy();
+        this.logger?.warn('websocket connection rate limited', { event: 'ws_connection_rate_limited', ip });
+        return;
+      }
+      this.wss.handleUpgrade(request, socket, head, (ws) => this.wss.emit('connection', ws, request));
+    });
     this.wss.on('connection', (socket) => this.handleConnection(socket));
   }
 
-  close(): Promise<void> {
-    return new Promise((resolve) => this.wss.close(() => resolve()));
+  isReady(): boolean {
+    return this.accepting;
+  }
+
+  async close(timeoutMs = 10_000): Promise<void> {
+    this.accepting = false;
+    for (const client of this.clients) client.socket.close(1001, 'server shutting down');
+    await Promise.race([waitForClientDrain(this.clients), delay(timeoutMs)]);
+    for (const client of this.clients) client.socket.terminate();
+    await new Promise<void>((resolve) => this.wss.close(() => resolve()));
   }
 
   private handleConnection(socket: WebSocket): void {
-    const state: ConnectionState = {};
+    const state: ConnectionState = { messageLimiter: this.messageLimiterFactory() };
     const client = { socket, state };
     this.clients.add(client);
     socket.on('close', () => {
       this.clients.delete(client);
-      if (state.deviceId) this.rooms.disconnect(state.deviceId).catch((error) => console.error('[ws] room disconnect failed', error));
+      if (state.deviceId) this.rooms.disconnect(state.deviceId).catch((error) => this.logger?.error('websocket room disconnect failed', { event: 'ws_room_disconnect_failed', deviceId: state.deviceId, error }));
     });
     socket.on('message', (raw) => {
       const payload = raw.toString();
       state.queue = (state.queue ?? Promise.resolve())
-        .then(() => this.handleMessage(socket, state, payload))
+        .then(() => {
+          state.messageLimiter.assertAllowed(state.deviceId ?? 'unauthenticated', 'Too many WebSocket messages');
+          return this.handleMessage(socket, state, payload);
+        })
         .catch((error) => send(socket, errorToWire(error)));
     });
   }
@@ -129,4 +166,29 @@ function errorToWire(error: unknown): ServerMessage {
   if (error instanceof SyncError) return { t: 'error', ...error.toWire() };
   if (typeof error === 'object' && error && 'issues' in error) return { t: 'error', code: ErrorCode.BAD_REQUEST, message: 'Validation failed', details: { issues: (error as { issues: unknown }).issues } };
   return { t: 'error', code: ErrorCode.INTERNAL, message: error instanceof Error ? error.message : 'Internal error' };
+}
+
+function clientIp(request: http.IncomingMessage): string {
+  const forwarded = request.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) return forwarded.split(',')[0]!.trim();
+  if (Array.isArray(forwarded) && forwarded[0]) return forwarded[0].split(',')[0]!.trim();
+  return request.socket.remoteAddress ?? 'unknown';
+}
+
+function waitForClientDrain(clients: Set<{ socket: WebSocket; state: ConnectionState }>): Promise<void> {
+  if (clients.size === 0) return Promise.resolve();
+  return new Promise((resolve) => {
+    let remaining = clients.size;
+    const done = () => {
+      remaining -= 1;
+      if (remaining <= 0) resolve();
+    };
+    for (const client of clients) {
+      void (client.state.queue ?? Promise.resolve()).finally(done);
+    }
+  });
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

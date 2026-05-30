@@ -1,4 +1,5 @@
 import { loadConfig } from './config.js';
+import { createLogger, parseLogLevel } from './log/logger.js';
 import { PgDatabase } from './db/pool.js';
 import { migrate } from './db/migrate.js';
 import { PgAuthRepository } from './auth/pg-repository.js';
@@ -23,10 +24,10 @@ async function main(): Promise<void> {
     const repo = new PgAuthRepository(db);
     const auth = new AuthService(repo, new TokenService(config.JWT_SECRET, repo));
     const a = args();
-    if (command === 'migrate') console.log(JSON.stringify({ applied: await migrate(db) }));
-    else if (command === 'create-user') console.log(JSON.stringify(await auth.createUser(required(a, 'username'), required(a, 'password'))));
-    else if (command === 'create-vault') console.log(JSON.stringify(await auth.createVault(required(a, 'name'), required(a, 'owner-user-id'))));
-    else if (command === 'add-member') { await auth.addMember(required(a, 'vault-id'), required(a, 'actor-user-id'), required(a, 'user-id'), required(a, 'role') as Role); console.log(JSON.stringify({ ok: true })); }
+    if (command === 'migrate') writeCliJson({ applied: await migrate(db) });
+    else if (command === 'create-user') writeCliJson(await auth.createUser(required(a, 'username'), required(a, 'password')));
+    else if (command === 'create-vault') writeCliJson(await auth.createVault(required(a, 'name'), required(a, 'owner-user-id')));
+    else if (command === 'add-member') { await auth.addMember(required(a, 'vault-id'), required(a, 'actor-user-id'), required(a, 'user-id'), required(a, 'role') as Role); writeCliJson({ ok: true }); }
     else usage();
   } finally {
     await db.close();
@@ -39,11 +40,15 @@ function required(a: Map<string, string>, key: string): string {
   return value;
 }
 
+function writeCliJson(value: unknown): void {
+  process.stdout.write(`${JSON.stringify(value)}\n`);
+}
+
 function usage(): never {
   throw new Error('Usage: migrate | create-user --username --password | create-vault --name --owner-user-id | add-member --vault-id --actor-user-id --user-id --role');
 }
 
 main().catch((error) => {
-  console.error(error instanceof Error ? error.message : error);
+  createLogger({ level: parseLogLevel(process.env.LOG_LEVEL) }).error('server cli failed', { event: 'server_cli_failed', error });
   process.exitCode = 1;
 });

@@ -37,7 +37,7 @@ COPY --from=builder --chown=obsync:obsync /app/packages/server/dist ./packages/s
 USER obsync
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider "http://127.0.0.1:${SERVER_PORT}/healthz" || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD wget --no-verbose --tries=1 --spider "http://127.0.0.1:${SERVER_PORT}/readyz" || exit 1
 
 CMD ["npm", "run", "start", "--workspace", "@obsidian-sync/server"]

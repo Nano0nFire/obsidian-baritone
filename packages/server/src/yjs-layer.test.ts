@@ -52,6 +52,10 @@ function textFromSnapshot(snapshot: Uint8Array): string {
 }
 
 async function delay(ms: number): Promise<void> { await new Promise((resolve) => setTimeout(resolve, ms)); }
+async function waitFor(predicate: () => boolean, timeoutMs = 250): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate() && Date.now() < deadline) await delay(5);
+}
 
 describe('Yjs Layer 2 room manager', () => {
   it('first promote seeds from Layer 1, assigns epoch, and records lease', async () => {
@@ -175,7 +179,7 @@ describe('Yjs Layer 2 room manager', () => {
     const state = await manager.promote(vaultId, fileId, deviceId, userId, sink);
     await manager.handleUpdate({ vaultId, fileId, deviceId, userId, roomEpoch: state.roomEpoch, updateId: 1, update: docUpdateFrom(state.yjsSnapshot, (text) => text.insert(5, '!')) });
     await manager.leave(vaultId, fileId, deviceId, state.roomEpoch);
-    await delay(35);
+    await waitFor(() => sink.messages.at(-1)?.t === 'room_closed');
     expect(sink.messages.at(-1)).toMatchObject({ t: 'room_closed', reason: 'demoted', fileId, roomEpoch: 1 });
     expect(broadcasts).toHaveLength(1);
     expect((broadcasts[0]!.ops[0] as { op: { deviceId: string; inlineText: string } }).op).toMatchObject({ deviceId: `collab:${fileId}`, inlineText: 'hello!' });
@@ -191,7 +195,7 @@ describe('Yjs Layer 2 room manager', () => {
     const sink = new FakeSink(deviceId);
     const state = await manager.promote(vaultId, fileId, deviceId, userId, sink);
     await manager.leave(vaultId, fileId, deviceId, state.roomEpoch);
-    await delay(35);
+    await waitFor(() => sink.messages.at(-1)?.t === 'error');
     expect(sink.messages.at(-1)).toMatchObject({ t: 'error', code: 'CONFLICT_PENDING' });
   });
 

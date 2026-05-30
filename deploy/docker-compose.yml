@@ -19,6 +19,12 @@ services:
       minio-init:
         condition: service_completed_successfully
         required: false
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:${SERVER_PORT:-3000}/readyz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
 
   migrate:
     image: obsidian-sync-server:latest

@@ -1,6 +1,8 @@
 import { Notice, Plugin, TFile, type DataAdapter } from "obsidian";
 import type { Extension } from "@codemirror/state";
+import { ViewPlugin, type EditorView, type PluginValue, type ViewUpdate } from "@codemirror/view";
 import { yCollab } from "y-codemirror.next";
+import * as Y from "yjs";
 import { DEFAULT_SETTINGS, ensureDeviceId, parseIgnoreLines, type PluginSettings } from "./settings.js";
 import { ObsidianSyncSettingTab } from "./settings-tab.js";
 import { LocalIndexStore, type PluginAdapter } from "./localindex/index.js";
@@ -8,6 +10,7 @@ import { SyncIgnore } from "./ignore/ignore.js";
 import { SyncTransport } from "./sync/transport.js";
 import { SyncEngine } from "./sync/engine.js";
 import { YjsSessionManager, type YjsSession } from "./sync/yjs-session.js";
+import { makeLocalAwarenessState, reduceAwarenessStates, type PresenceParticipant } from "./sync/awareness-ui.js";
 import { InitialSyncRunner } from "./sync/initial-sync.js";
 import { VaultWatcher } from "./watcher/vault-watcher.js";
 import { ConflictStore } from "./conflict/conflict-store.js";
@@ -18,6 +21,49 @@ import type { VaultIO, VaultFileInfo } from "./sync/vault-io.js";
 import type { ConflictRecord } from "@obsidian-sync/shared";
 
 const STATE_PATH = ".obsidian/plugins/obsidian-sync/state.json";
+
+type AwarenessCursor = { anchor: Y.RelativePosition; head: Y.RelativePosition };
+
+function isAwarenessCursor(value: unknown): value is AwarenessCursor {
+  return !!value && typeof value === "object" && "anchor" in value && "head" in value;
+}
+
+function sameCursor(current: unknown, next: AwarenessCursor): boolean {
+  if (!isAwarenessCursor(current)) return false;
+  try {
+    return Y.compareRelativePositions(current.anchor, next.anchor) && Y.compareRelativePositions(current.head, next.head);
+  } catch {
+    return false;
+  }
+}
+
+function publishLocalCursor(view: EditorView, session: YjsSession): void {
+  const localState = session.awareness.getLocalState();
+  if (!localState) return;
+  if (!view.hasFocus || !view.dom.ownerDocument.hasFocus()) {
+    if (localState.cursor != null) session.awareness.setLocalStateField("cursor", null);
+    return;
+  }
+  const selection = view.state.selection.main;
+  const cursor = {
+    anchor: Y.createRelativePositionFromTypeIndex(session.text, selection.anchor),
+    head: Y.createRelativePositionFromTypeIndex(session.text, selection.head),
+  };
+  if (!sameCursor(localState.cursor, cursor)) session.awareness.setLocalStateField("cursor", cursor);
+}
+
+function localAwarenessCursorExtension(session: YjsSession): Extension {
+  return ViewPlugin.fromClass(class implements PluginValue {
+    constructor(private readonly view: EditorView) { publishLocalCursor(view, session); }
+    update(update: ViewUpdate): void {
+      if (update.selectionSet || update.focusChanged || update.docChanged) publishLocalCursor(update.view, session);
+    }
+    destroy(): void {
+      const localState = session.awareness.getLocalState();
+      if (localState?.cursor != null) session.awareness.setLocalStateField("cursor", null);
+    }
+  });
+}
 
 function mergeSettings(data: unknown): PluginSettings {
   const input = (data && typeof data === "object") ? data as Partial<PluginSettings> : {};
@@ -86,8 +132,10 @@ export default class ObsidianSyncPlugin extends Plugin {
   private watcher!: VaultWatcher;
   private conflictStore = new ConflictStore();
   private statusEl: HTMLElement | null = null;
+  private presenceEl: HTMLElement | null = null;
   private activeFileId: string | null = null;
   private activeOpenToken = 0;
+  private activeAwarenessCleanup: (() => void) | null = null;
   private readonly yjsEditorExtensions: Extension[] = [];
 
   override async onload(): Promise<void> {
@@ -111,7 +159,10 @@ export default class ObsidianSyncPlugin extends Plugin {
     const ignore = new SyncIgnore({ common: parseIgnoreLines(this.settings.commonIgnore), local: [...parseIgnoreLines(this.settings.localIgnore), ...localConfigIgnorePatterns(this.settings)] });
     this.watcher = new VaultWatcher(vaultIO, this.index, this.engine, ignore);
     this.statusEl = this.addStatusBarItem();
+    this.presenceEl = this.addStatusBarItem();
+    this.presenceEl.classList.add("obsidian-sync-presence");
     this.setStatus(this.settings.paused ? "paused" : "loading");
+    this.renderPresence([]);
     this.addSettingTab(new ObsidianSyncSettingTab(this.app, this));
     this.registerView(VIEW_TYPE_CONFLICTS, (leaf) => new ConflictPanel(leaf, this.conflictStore, this.transport, (conflict) => void this.openMerge(conflict)));
     this.registerEditorExtension(this.yjsEditorExtensions);
@@ -186,7 +237,10 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.activeFileId = nextFileId;
     try {
       const session = await this.yjsManager.openFile(nextFileId);
-      if (token !== this.activeOpenToken || this.activeFileId !== nextFileId) return;
+      if (token !== this.activeOpenToken || this.activeFileId !== nextFileId) {
+        if (this.activeFileId !== nextFileId) await this.yjsManager.leaveFile(nextFileId);
+        return;
+      }
       this.setYjsEditorSession(session);
     } catch (error) {
       if (token === this.activeOpenToken) {
@@ -198,8 +252,50 @@ export default class ObsidianSyncPlugin extends Plugin {
   }
 
   private setYjsEditorSession(session: YjsSession | null): void {
-    this.yjsEditorExtensions.splice(0, this.yjsEditorExtensions.length, ...(session ? [yCollab(session.text, session.awareness)] : []));
+    this.activeAwarenessCleanup?.();
+    this.activeAwarenessCleanup = null;
+    if (session) {
+      session.awareness.setLocalState(makeLocalAwarenessState(this.settings));
+      const updatePresence = () => this.renderPresence(reduceAwarenessStates(session.awareness.getStates(), session.awareness.clientID));
+      session.awareness.on("change", updatePresence);
+      this.activeAwarenessCleanup = () => {
+        session.awareness.off("change", updatePresence);
+        if (session.awareness.getLocalState()) session.awareness.setLocalState(null);
+        this.renderPresence([]);
+      };
+      updatePresence();
+    } else {
+      this.renderPresence([]);
+    }
+    this.yjsEditorExtensions.splice(0, this.yjsEditorExtensions.length, ...(session ? [yCollab(session.text, session.awareness), localAwarenessCursorExtension(session)] : []));
     this.app.workspace.updateOptions();
+  }
+
+  private renderPresence(participants: readonly PresenceParticipant[]): void {
+    if (!this.presenceEl) return;
+    this.presenceEl.replaceChildren();
+    this.presenceEl.setAttribute("aria-label", participants.length ? `Realtime collaborators: ${participants.map((participant) => participant.name).join(", ")}` : "No active realtime collaborators");
+    if (participants.length === 0) {
+      this.presenceEl.setText("Presence: solo");
+      return;
+    }
+    const prefix = document.createElement("span");
+    prefix.className = "obsidian-sync-presence-prefix";
+    prefix.textContent = "Presence:";
+    this.presenceEl.appendChild(prefix);
+    for (const participant of participants) {
+      const chip = document.createElement("span");
+      chip.className = `obsidian-sync-presence-chip${participant.hasCursor ? " is-active" : " is-idle"}${participant.isLocal ? " is-local" : ""}`;
+      chip.title = `${participant.name}${participant.isLocal ? " (you)" : ""}${participant.hasCursor ? " — editing" : " — idle"}`;
+      const dot = document.createElement("span");
+      dot.className = "obsidian-sync-presence-dot";
+      dot.style.backgroundColor = participant.color;
+      const name = document.createElement("span");
+      name.className = "obsidian-sync-presence-name";
+      name.textContent = `${participant.name}${participant.isLocal ? " (you)" : ""}`;
+      chip.append(dot, name);
+      this.presenceEl.appendChild(chip);
+    }
   }
 
   private async activateConflictsView(): Promise<void> {
