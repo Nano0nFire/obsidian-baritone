@@ -4,6 +4,7 @@ const vv = z.record(z.string().min(1), z.number().int().nonnegative());
 const pathClock = z.object({ lamport: z.number().int().nonnegative(), deviceId: z.string().min(1) });
 const fileType = z.enum(['note', 'attachment', 'config']);
 const opKind = z.enum(['create', 'update', 'rename', 'delete', 'restore']);
+const contentEncoding = z.object({ algorithm: z.literal('aes-256-gcm-pbkdf2-sha256-convergent-v1'), version: z.literal(1) });
 
 export const fileOpSchema = z.object({
   opId: z.string().uuid(),
@@ -17,6 +18,7 @@ export const fileOpSchema = z.object({
   newContentVV: vv.optional(),
   contentHash: z.string().optional(),
   size: z.number().int().nonnegative().optional(),
+  contentEncoding: contentEncoding.optional(),
   inlineText: z.string().optional(),
   blobRef: z.string().optional(),
   newPath: z.string().optional(),

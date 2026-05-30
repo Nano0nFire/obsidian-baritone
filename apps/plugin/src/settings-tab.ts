@@ -8,6 +8,29 @@ function httpFromWs(url: string): string {
   return url;
 }
 
+class EncryptionPassphraseModal extends Modal {
+  private passphrase = "";
+  constructor(app: App, private readonly plugin: ObsidianSyncPlugin, private readonly enable: boolean) { super(app); }
+  override onOpen(): void {
+    this.contentEl.empty();
+    this.contentEl.createEl("h2", { text: this.enable ? "Enable vault content encryption" : "Disable vault content encryption" });
+    this.contentEl.createEl("p", { text: this.enable
+      ? "Enter the vault encryption passphrase. It is used only locally to derive the session key; only a salt and verifier are stored. Layer 2 realtime collaboration will be disabled."
+      : "Enter the current vault encryption passphrase to confirm disabling encryption for future writes. Existing remote ciphertext is not migrated automatically." });
+    new Setting(this.contentEl).setName("Passphrase").addText((text) => { text.inputEl.type = "password"; text.onChange((value) => { this.passphrase = value; }); });
+    new Setting(this.contentEl).addButton((button) => button.setButtonText(this.enable ? "Enable encryption" : "Disable encryption").setCta().onClick(() => void this.apply()));
+  }
+  private async apply(): Promise<void> {
+    try {
+      await this.plugin.configureContentEncryption(this.passphrase, this.enable);
+      new Notice(this.enable ? "Vault content encryption enabled for new uploads" : "Vault content encryption disabled for new uploads");
+      this.close();
+    } catch (error) {
+      new Notice(`Encryption setup failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+}
+
 class LoginModal extends Modal {
   private username = "";
   private password = "";
@@ -55,6 +78,14 @@ export class ObsidianSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Device ID").setDesc(this.plugin.settings.deviceId).addButton((button) => button.setButtonText("Regenerate").onClick(async () => { this.plugin.settings.deviceId = crypto.randomUUID(); await this.plugin.saveSettingsAndRestart(); this.display(); }));
     new Setting(containerEl).setName("Login").setDesc(this.plugin.settings.username ? `Logged in as ${this.plugin.settings.username}` : "No credentials stored").addButton((button) => button.setButtonText("Login").setCta().onClick(() => new LoginModal(this.app, this.plugin).open()));
     new Setting(containerEl).setName("Remote deletes").setDesc("Where files deleted by remote ops are moved locally.").addDropdown((drop) => drop.addOption("obsidian-trash", "Obsidian .trash").addOption("system-trash", "System trash").setValue(this.plugin.settings.remoteDeleteTarget).onChange(async (value) => { this.plugin.settings.remoteDeleteTarget = value as typeof this.plugin.settings.remoteDeleteTarget; await this.plugin.saveSettingsOnly(); }));
+    new Setting(containerEl)
+      .setName("Vault content encryption")
+      .setDesc(this.plugin.settings.contentEncryption.enabled
+        ? `Enabled${this.plugin.encryptionUnlocked() ? " and unlocked" : " but locked"}. Server stores Layer 1 ciphertext; realtime collaboration is disabled.`
+        : "Off by default. Enable only after reading the migration warning; paths, sizes, and timing are not hidden.")
+      .addButton((button) => button
+        .setButtonText(this.plugin.settings.contentEncryption.enabled ? "Disable" : "Enable")
+        .onClick(() => new EncryptionPassphraseModal(this.app, this.plugin, !this.plugin.settings.contentEncryption.enabled).open()));
     new Setting(containerEl).setName("Pause sync").addToggle((toggle) => toggle.setValue(this.plugin.settings.paused).onChange(async (value) => { this.plugin.settings.paused = value; await this.plugin.saveSettingsAndRestart(); }));
     containerEl.createEl("h3", { text: "Config sync" });
     containerEl.createEl("p", {

@@ -1,4 +1,4 @@
-import { contentHash, contentHashText, type FileType } from "@obsidian-sync/shared";
+import { type FileType } from "@obsidian-sync/shared";
 import { canonicalVaultPath, isTextPath } from "../pathing.js";
 import type { SyncIgnore } from "../ignore/ignore.js";
 import type { LocalIndexStore } from "../localindex/index.js";
@@ -84,8 +84,7 @@ export class VaultWatcher {
   }
 
   private async hashPath(path: string): Promise<string> {
-    if (isTextPath(path)) return contentHashText(await this.vault.readText(path));
-    return contentHash(await this.vault.readBytes(path));
+    return this.engine.hashPath(path);
   }
 
   private fileInfo(path: string): VaultFileInfo | undefined {

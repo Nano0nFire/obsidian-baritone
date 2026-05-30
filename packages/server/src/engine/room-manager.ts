@@ -80,6 +80,7 @@ export class RoomManager {
     const room = await this.materialize(vaultId, fileId);
     return room.lock.run(async () => {
       const file = await this.requiredLiveFile(vaultId, fileId);
+      if (file.contentEncoding) throw new SyncError(ErrorCode.UNSUPPORTED, 'Layer 2 realtime collaboration is disabled for encrypted content');
       const now = this.now();
       if (!room.persisted.active || room.state === 'closed') await this.activate(room, file, deviceId, now);
       room.state = 'active';

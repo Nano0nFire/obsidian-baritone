@@ -1,5 +1,6 @@
 import type { VersionVector } from '../clock/version-vector.js';
 import type { PathClock } from '../clock/lamport.js';
+import type { ContentEncryptionEncoding } from '../crypto/content-encryption.js';
 
 /** Current wire protocol version. Bump on breaking changes. */
 export const PROTOCOL_VERSION = 1;
@@ -32,6 +33,8 @@ export interface FileOp {
   newContentVV?: VersionVector;
   contentHash?: string;
   size?: number;
+  /** Content encoding metadata. Omitted means plaintext legacy Layer 1 bytes. */
+  contentEncoding?: ContentEncryptionEncoding;
   /** Inline UTF-8 text for small notes; omitted when stored as a blob. */
   inlineText?: string;
   /** Blob reference (content hash) for attachments / large content. */
@@ -64,6 +67,7 @@ export interface ManifestEntry {
   contentHash: string | null;
   size: number | null;
   blobRef: string | null;
+  contentEncoding?: ContentEncryptionEncoding | null;
   contentVV: VersionVector;
   pathClock: PathClock;
   epoch: number;

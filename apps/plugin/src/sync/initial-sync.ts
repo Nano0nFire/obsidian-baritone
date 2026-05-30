@@ -1,4 +1,4 @@
-import { contentHash, type ContentMessage, type ManifestEntry, type ManifestPageMessage } from "@obsidian-sync/shared";
+import { ENCRYPTED_BLOB_ALGORITHM, contentHash, decryptVaultBytes, isEncryptedBlobEnvelope, type ContentMessage, type ManifestEntry, type ManifestPageMessage, type VaultContentKey } from "@obsidian-sync/shared";
 import type { LocalIndexStore } from "../localindex/index.js";
 import type { SyncTransport } from "./transport.js";
 import type { VaultIO } from "./vault-io.js";
@@ -12,7 +12,7 @@ function decodeBase64(data: string): Uint8Array {
 }
 
 export class InitialSyncRunner {
-  constructor(private readonly transport: SyncTransport, private readonly index: LocalIndexStore, private readonly vault: VaultIO, private readonly vaultId: string) {}
+  constructor(private readonly transport: SyncTransport, private readonly index: LocalIndexStore, private readonly vault: VaultIO, private readonly vaultId: string, private readonly contentKeyProvider: () => VaultContentKey | null = () => null) {}
 
   async run(): Promise<void> {
     let cursor = this.index.device.manifestCursor ?? undefined;
@@ -37,7 +37,8 @@ export class InitialSyncRunner {
   private async applyManifestEntry(entry: ManifestEntry): Promise<void> {
     if (entry.deleted || !entry.contentHash) return;
     let bytes: Uint8Array;
-    if (this.index.device.downloadedHashes.includes(entry.contentHash) && this.vault.exists(entry.path)) {
+    const canUseLocalCache = !entry.contentEncoding && this.index.device.downloadedHashes.includes(entry.contentHash) && this.vault.exists(entry.path);
+    if (canUseLocalCache) {
       bytes = await this.vault.readBytes(entry.path);
     } else {
       const contentPromise = this.transport.waitFor("content", (msg): msg is ContentMessage => msg.hash === entry.contentHash);
@@ -45,11 +46,18 @@ export class InitialSyncRunner {
       const content = await contentPromise;
       if (content.data === null) throw new Error(`Content ${entry.contentHash} unavailable; manifest must be refreshed`);
       bytes = decodeBase64(content.data);
-      await this.vault.writeBytes(entry.path, bytes);
       this.index.device.downloadedHashes = [...new Set([...this.index.device.downloadedHashes, entry.contentHash])];
     }
     const actual = await contentHash(bytes);
     if (actual !== entry.contentHash) throw new Error(`Hash verification failed for ${entry.path}`);
+    if (entry.contentEncoding) {
+      if (entry.contentEncoding.algorithm !== ENCRYPTED_BLOB_ALGORITHM || !isEncryptedBlobEnvelope(bytes)) throw new Error(`Unsupported encrypted content format for ${entry.path}`);
+      const key = this.contentKeyProvider();
+      if (!key) throw new Error("Vault content encryption is enabled but no passphrase has been unlocked for this session");
+      bytes = await decryptVaultBytes(bytes, key);
+    }
+    if (entry.type === "note" || entry.type === "config") await this.vault.writeText(entry.path, new TextDecoder().decode(bytes));
+    else await this.vault.writeBytes(entry.path, bytes);
     this.index.upsertFile({
       fileId: entry.fileId,
       path: entry.path,

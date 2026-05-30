@@ -47,6 +47,28 @@ export class BlobStore {
     if ((await hashBytes(bytes)) !== hash) throw new SyncError(ErrorCode.BLOB_HASH_MISMATCH, 'Blob hash mismatch');
   }
 
+  async getBytes(hash: string): Promise<Uint8Array | null> {
+    if (!isValidContentHash(hash)) throw new SyncError(ErrorCode.BAD_REQUEST, 'Invalid hash');
+    const blob = await this.data.getBlob(hash);
+    if (!blob || blob.state !== 'verified') return null;
+    const response = await this.s3.send(new GetObjectCommand({ Bucket: this.config.bucket, Key: blob.objectKey }));
+    if (!response.Body || typeof (response.Body as AsyncIterable<Uint8Array>)[Symbol.asyncIterator] !== 'function') return null;
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for await (const chunk of response.Body as AsyncIterable<Uint8Array>) {
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    await this.verifyBytes(hash, bytes);
+    return bytes;
+  }
+
   async gcUnreferenced(minAgeMs: number, now = new Date()): Promise<string[]> {
     const removed: string[] = [];
     const data = this.data as unknown as { blobs?: Map<string, BlobRecord> };

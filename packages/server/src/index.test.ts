@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { contentHashText } from '@obsidian-sync/shared';
+import { contentHashText, CONTENT_ENCRYPTION_ENCODING } from '@obsidian-sync/shared';
 import { AuthService } from './auth/service.js';
 import { TokenService, type RefreshTokenRecord, type TokenRepository } from './auth/tokens.js';
 import { BlobStore } from './blob/store.js';
@@ -86,6 +86,23 @@ describe('op processor guards', () => {
     const p = new OpProcessor(s);
     const result = await p.process({ opId: crypto.randomUUID(), deviceId, deviceSeq: 3, fileId, vaultId, kind: 'delete', type: 'note' }, userId);
     expect(result).toMatchObject({ type: 'reject', code: 'STALE', details: { expected: 6 } });
+  });
+
+  it('rejects encrypted content that references no uploaded blob', async () => {
+    const s = store(); const p = new OpProcessor(s);
+    const hash = await contentHashText('ciphertext-that-was-never-uploaded');
+    const result = await p.process({ opId: crypto.randomUUID(), deviceId, deviceSeq: 1, fileId, vaultId, kind: 'create', type: 'note', newPath: 'Secret.md', pathClock: { lamport: 1, deviceId }, newContentVV: { [deviceId]: 1 }, contentHash: hash, contentEncoding: CONTENT_ENCRYPTION_ENCODING, size: 64 }, userId);
+    expect(result).toMatchObject({ type: 'reject', code: 'BAD_REQUEST' });
+    expect(await s.getFile(vaultId, fileId)).toBeNull();
+  });
+
+  it('accepts encrypted content whose ciphertext is already stored (dedup by hash)', async () => {
+    const s = store(); const p = new OpProcessor(s);
+    const cipher = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const hash = await contentHashText('already-present');
+    await s.putContent(hash, cipher);
+    const result = await p.process({ opId: crypto.randomUUID(), deviceId, deviceSeq: 1, fileId, vaultId, kind: 'create', type: 'note', newPath: 'Dedup.md', pathClock: { lamport: 1, deviceId }, newContentVV: { [deviceId]: 1 }, contentHash: hash, contentEncoding: CONTENT_ENCRYPTION_ENCODING, size: cipher.byteLength }, userId);
+    expect(result).toMatchObject({ type: 'ack' });
   });
 
   it('replays the stored result for an already-processed device seq', async () => {

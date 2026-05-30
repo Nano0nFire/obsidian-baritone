@@ -66,6 +66,8 @@ async function validatePayload(op: FileOp, tx: OpDataStore): Promise<void> {
   if (op.newPath) normalizePath(op.newPath);
   if ((op.kind === 'create' || op.kind === 'update' || op.kind === 'restore') && op.contentHash) {
     if (!isValidContentHash(op.contentHash)) throw new SyncError(ErrorCode.BAD_REQUEST, 'Invalid content hash');
+    if (op.contentEncoding && op.inlineText !== undefined) throw new SyncError(ErrorCode.BAD_REQUEST, 'Encrypted content must be uploaded as an opaque blob');
+    if (op.contentEncoding && !op.blobRef && !(await tx.getContent(op.contentHash))) throw new SyncError(ErrorCode.BAD_REQUEST, 'Encrypted content requires an uploaded blob');
     if (op.inlineText !== undefined) {
       const actual = await contentHashText(op.inlineText);
       if (actual !== op.contentHash) throw new SyncError(ErrorCode.BLOB_HASH_MISMATCH, 'Inline content hash mismatch');
@@ -98,7 +100,7 @@ async function applyUpdate(op: FileOp, file: StoredFile, tx: OpDataStore): Promi
     }
     throw new SyncError(ErrorCode.STALE, 'Content version does not dominate stored version');
   }
-  const updated = { ...file, contentVV: newVV, contentHash: op.contentHash ?? op.blobRef ?? file.contentHash, size: op.size ?? file.size, blobRef: op.blobRef ?? null, deleted: false, deletedAt: null, conflictId: null, updatedAt: new Date() };
+  const updated = { ...file, contentVV: newVV, contentHash: op.contentHash ?? op.blobRef ?? file.contentHash, size: op.size ?? file.size, blobRef: op.blobRef ?? null, contentEncoding: op.contentEncoding ?? null, deleted: false, deletedAt: null, conflictId: null, updatedAt: new Date() };
   await updateBlobRefs(tx, file, updated);
   return { file: updated };
 }
@@ -118,7 +120,7 @@ async function applyDelete(op: FileOp, file: StoredFile): Promise<StoredFile> {
 async function applyRestore(op: FileOp, file: StoredFile, tx: OpDataStore): Promise<StoredFile> {
   const restoredVV = join(file.deleteVV ?? {}, op.newContentVV ?? file.contentVV);
   const path = await uniquePath(tx, op.vaultId, normalizePath(op.newPath ?? file.path), op.fileId);
-  const restored = { ...file, path, pathNormalized: path.toLowerCase(), contentVV: restoredVV, contentHash: op.contentHash ?? file.contentHash, size: op.size ?? file.size, blobRef: op.blobRef ?? file.blobRef, deleteVV: null, deleted: false, deletedAt: null, epoch: file.epoch + 1, conflictId: null, updatedAt: new Date() };
+  const restored = { ...file, path, pathNormalized: path.toLowerCase(), contentVV: restoredVV, contentHash: op.contentHash ?? file.contentHash, size: op.size ?? file.size, blobRef: op.blobRef ?? file.blobRef, contentEncoding: op.contentEncoding ?? file.contentEncoding, deleteVV: null, deleted: false, deletedAt: null, epoch: file.epoch + 1, conflictId: null, updatedAt: new Date() };
   await updateBlobRefs(tx, file, restored);
   return restored;
 }

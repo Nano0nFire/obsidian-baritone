@@ -17,6 +17,14 @@ export const CONFIG_CATEGORIES: readonly ConfigCategoryInfo[] = [
   { key: "workspace", label: "Workspace layout", description: "workspace*.json layout state. Usually best kept device-local." },
 ] as const;
 
+export interface ContentEncryptionSettings {
+  enabled: boolean;
+  /** Base64 PBKDF2 salt generated locally per vault and never sent to the server. */
+  salt?: string;
+  /** Base64 encrypted verifier used to reject wrong passphrases without storing the passphrase. */
+  verifier?: string;
+}
+
 export interface PluginSettings {
   serverUrl: string;
   vaultId: string;
@@ -25,6 +33,7 @@ export interface PluginSettings {
   refreshToken: string;
   deviceId: string;
   remoteDeleteTarget: RemoteDeleteTarget;
+  contentEncryption: ContentEncryptionSettings;
   configSync: Record<ConfigCategory, ConfigSyncMode>;
   commonIgnore: string;
   localIgnore: string;
@@ -40,6 +49,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   refreshToken: "",
   deviceId: "",
   remoteDeleteTarget: "obsidian-trash",
+  contentEncryption: { enabled: false },
   configSync: {
     app: "common",
     corePlugins: "common",

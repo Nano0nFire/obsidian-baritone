@@ -1,10 +1,16 @@
 import {
+  CONTENT_ENCRYPTION_ENCODING,
+  ENCRYPTED_BLOB_ALGORITHM,
   ErrorCode,
   PROTOCOL_VERSION,
   bump,
   contentHash,
   contentHashText,
+  decryptVaultBytes,
+  encryptVaultBytes,
+  isEncryptedBlobEnvelope,
   join,
+  serializeEncryptedBlob,
   makePathClock,
   nextLamport,
   type AppliedOp,
@@ -16,8 +22,10 @@ import {
   type PathClock,
   type RejectMessage,
   type ServerMessage,
+  type VaultContentKey,
   type VersionVector,
 } from "@obsidian-sync/shared";
+import { BlobUploader } from "../blob/uploader.js";
 import type { PluginSettings } from "../settings.js";
 import type { LocalIndexStore } from "../localindex/index.js";
 import { OutboxManager, type FileOpDraft } from "./outbox.js";
@@ -45,6 +53,7 @@ export interface EngineHooks {
 
 export class SyncEngine {
   private outbox: OutboxManager;
+  private readonly blobUploader: BlobUploader;
   private lamport = 0;
   private state: EngineState = "idle";
   private unsubscribe: Array<() => void> = [];
@@ -56,8 +65,10 @@ export class SyncEngine {
     private readonly transport: SyncTransport,
     private readonly hooks: EngineHooks = {},
     private readonly yjs?: YjsSessionManager,
+    private readonly contentKeyProvider: () => VaultContentKey | null = () => null,
   ) {
     this.outbox = new OutboxManager(settings.deviceId, index.device.nextDeviceSeq, index.device.outbox);
+    this.blobUploader = new BlobUploader(transport);
   }
 
   start(): void {
@@ -103,18 +114,34 @@ export class SyncEngine {
     let size: number;
     let inlineText: string | undefined;
     let blobRef: string | undefined;
-    if (typeof textOrBytes === "string" || (textOrBytes === undefined && isTextPath(path))) {
+    let contentEncoding: FileOpDraft["contentEncoding"];
+    if (this.isEncryptionEnabled()) {
+      const plaintext = await this.readPlaintextBytes(path, textOrBytes);
+      const encrypted = await this.encryptForStorage(plaintext);
+      contentHashValue = await this.blobUploader.upload(fileId, encrypted);
+      size = encrypted.byteLength;
+      blobRef = contentHashValue;
+      contentEncoding = CONTENT_ENCRYPTION_ENCODING;
+    } else if (typeof textOrBytes === "string" || (textOrBytes === undefined && isTextPath(path))) {
       const text = typeof textOrBytes === "string" ? textOrBytes : await this.vault.readText(path);
       contentHashValue = await contentHashText(text);
       size = new TextEncoder().encode(text).byteLength;
       inlineText = text;
     } else {
       const bytes = textOrBytes instanceof Uint8Array ? textOrBytes : await this.vault.readBytes(path);
-      contentHashValue = await contentHash(bytes);
+      contentHashValue = await this.blobUploader.upload(fileId, bytes);
       size = bytes.byteLength;
       blobRef = contentHashValue;
     }
-    return { vaultId: this.settings.vaultId, fileId, kind: entry ? "update" : "create", type, baseContentVV: base, newContentVV: next, contentHash: contentHashValue, size, inlineText, blobRef };
+    return { vaultId: this.settings.vaultId, fileId, kind: entry ? "update" : "create", type, baseContentVV: base, newContentVV: next, contentHash: contentHashValue, size, contentEncoding, inlineText, blobRef };
+  }
+
+  async hashPath(path: string): Promise<string> {
+    if (!this.isEncryptionEnabled()) {
+      if (isTextPath(path)) return contentHashText(await this.vault.readText(path));
+      return contentHash(await this.vault.readBytes(path));
+    }
+    return contentHash(await this.encryptForStorage(await this.readPlaintextBytes(path)));
   }
 
   makeRenameOp(fileId: string, newPath: string, type: FileType): FileOpDraft {
@@ -127,7 +154,13 @@ export class SyncEngine {
     return { vaultId: this.settings.vaultId, fileId, kind: "delete", type, deleteClock: makePathClock(this.lamport, this.settings.deviceId) };
   }
 
-  promote(fileId: string): void { this.transport.send({ t: "promote", fileId }); }
+  promote(fileId: string): void {
+    if (this.isEncryptionEnabled()) {
+      this.hooks.onError?.(new Error("Realtime collaboration is disabled while vault content encryption is enabled"));
+      return;
+    }
+    this.transport.send({ t: "promote", fileId });
+  }
   demote(fileId: string): void { this.transport.send({ t: "demote", fileId }); }
   requestResync(): void { this.transport.send({ t: "get_ops", sinceSeq: this.index.device.appliedSeq }); }
   isRealtimeActiveFile(fileId: string): boolean { return this.yjs?.hasSession(fileId) ?? false; }
@@ -264,7 +297,7 @@ export class SyncEngine {
       if (!target) return;
       const configDecision = shouldApplyConfigPath(target, this.settings);
       if (configDecision.category && !configDecision.applies) return;
-      const activeRealtime = this.yjs?.hasSession(op.fileId) && isTextPath(target);
+      const activeRealtime = !op.contentEncoding && this.yjs?.hasSession(op.fileId) && isTextPath(target);
       if (activeRealtime) {
         const text = op.inlineText ?? new TextDecoder().decode(await this.fetchContentBytes(op.contentHash));
         const result = await this.yjs?.reconcileLayer1Content(op.fileId, text, op.contentHash);
@@ -272,7 +305,7 @@ export class SyncEngine {
       } else if (op.inlineText !== undefined) {
         await this.vault.writeText(target, op.inlineText);
       } else {
-        await this.fetchAndWriteBlob(target, op.contentHash);
+        await this.fetchAndWriteBlob(target, op.contentHash, op.contentEncoding);
       }
       this.index.upsertFile({
         fileId: op.fileId,
@@ -289,24 +322,52 @@ export class SyncEngine {
     }
   }
 
-  private async fetchAndWriteBlob(target: string, hash: string): Promise<void> {
+  private async fetchAndWriteBlob(target: string, hash: string, contentEncoding?: FileOp["contentEncoding"]): Promise<void> {
     if (this.index.device.downloadedHashes.includes(hash) && this.vault.exists(target)) {
-      const existing = await this.vault.readBytes(target);
-      if ((await contentHash(existing)) === hash) return;
+      if (contentEncoding) {
+        if ((await this.hashPath(target)) === hash) return;
+      } else {
+        const existing = await this.vault.readBytes(target);
+        if ((await contentHash(existing)) === hash) return;
+      }
     }
-    const bytes = await this.fetchContentBytes(hash);
-    await this.vault.writeBytes(target, bytes);
+    const bytes = await this.fetchContentBytes(hash, contentEncoding);
+    if (contentEncoding && isTextPath(target)) await this.vault.writeText(target, new TextDecoder().decode(bytes));
+    else await this.vault.writeBytes(target, bytes);
     this.index.device.downloadedHashes = [...new Set([...this.index.device.downloadedHashes, hash])];
   }
 
-  private async fetchContentBytes(hash: string): Promise<Uint8Array> {
+  private async fetchContentBytes(hash: string, contentEncoding?: FileOp["contentEncoding"]): Promise<Uint8Array> {
     const contentPromise = this.transport.waitFor("content", (msg): msg is ContentMessage => msg.hash === hash);
     this.transport.send({ t: "get_content", hash });
     const content = await contentPromise;
     if (content.data === null) throw new Error(`Content ${hash} unavailable; resync required`);
     const bytes = decodeBase64(content.data);
     if ((await contentHash(bytes)) !== hash) throw new Error(`Hash verification failed for ${hash}`);
-    return bytes;
+    if (!contentEncoding) return bytes;
+    if (contentEncoding.algorithm !== ENCRYPTED_BLOB_ALGORITHM || !isEncryptedBlobEnvelope(bytes)) throw new Error(`Unsupported encrypted content format for ${hash}`);
+    return decryptVaultBytes(bytes, this.requireContentKey());
+  }
+
+  private isEncryptionEnabled(): boolean {
+    return this.settings.contentEncryption.enabled;
+  }
+
+  private requireContentKey(): VaultContentKey {
+    const key = this.contentKeyProvider();
+    if (!key) throw new Error("Vault content encryption is enabled but no passphrase has been unlocked for this session");
+    return key;
+  }
+
+  private async encryptForStorage(plaintext: Uint8Array): Promise<Uint8Array> {
+    return serializeEncryptedBlob(await encryptVaultBytes(plaintext, this.requireContentKey()));
+  }
+
+  private async readPlaintextBytes(path: string, textOrBytes?: string | Uint8Array): Promise<Uint8Array> {
+    if (typeof textOrBytes === "string") return new TextEncoder().encode(textOrBytes);
+    if (textOrBytes instanceof Uint8Array) return textOrBytes;
+    if (isTextPath(path)) return new TextEncoder().encode(await this.vault.readText(path));
+    return this.vault.readBytes(path);
   }
 
   private async persistOutbox(): Promise<void> {

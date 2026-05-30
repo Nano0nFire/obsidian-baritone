@@ -68,6 +68,8 @@ export interface YjsSessionManagerOptions {
   readonly ackTimeoutMs?: number;
   readonly textName?: string;
   readonly onSessionChanged?: (fileId: string, session: YjsSession | null) => void;
+  readonly canPromote?: () => boolean;
+  readonly promoteDisabledReason?: string;
 }
 
 export interface Layer1ReconcileResult {
@@ -92,16 +94,21 @@ export class YjsSessionManager {
   private readonly ackTimeoutMs: number;
   private readonly textName: string;
   private readonly onSessionChanged?: (fileId: string, session: YjsSession | null) => void;
+  private readonly canPromote: () => boolean;
+  private readonly promoteDisabledReason: string;
 
   constructor(private readonly transport: SyncTransport, options: YjsSessionManagerOptions = {}) {
     this.ackTimeoutMs = options.ackTimeoutMs ?? 5_000;
     this.textName = options.textName ?? "content";
     this.onSessionChanged = options.onSessionChanged;
+    this.canPromote = options.canPromote ?? (() => true);
+    this.promoteDisabledReason = options.promoteDisabledReason ?? "Realtime collaboration is disabled";
   }
 
   async openFile(fileId: string): Promise<YjsSession> {
     const existing = this.sessions.get(fileId);
     if (existing) return existing;
+    if (!this.canPromote()) throw new Error(this.promoteDisabledReason);
     const roomState = this.transport.waitFor("room_state", (message) => message.fileId === fileId, 30_000);
     this.transport.send({ t: "promote", fileId });
     return this.handleRoomState(await roomState);

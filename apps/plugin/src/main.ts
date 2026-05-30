@@ -18,7 +18,20 @@ import { ConflictPanel, VIEW_TYPE_CONFLICTS } from "./conflict/conflict-panel.js
 import { ManualChoiceModal, TextMergeModal, conflictResolvedVV } from "./conflict/merge-view.js";
 import { localConfigIgnorePatterns } from "./configsync/configsync.js";
 import type { VaultIO, VaultFileInfo } from "./sync/vault-io.js";
-import type { ConflictRecord, SnapshotVersionMetadata } from "@obsidian-sync/shared";
+import {
+  base64ToBytes,
+  bytesToBase64,
+  contentHash,
+  createEncryptionVerifier,
+  decryptVaultBytes,
+  deriveVaultContentKey,
+  isEncryptedBlobEnvelope,
+  randomEncryptionSalt,
+  verifyEncryptionPassphrase,
+  type ConflictRecord,
+  type SnapshotVersionMetadata,
+  type VaultContentKey,
+} from "@obsidian-sync/shared";
 
 const STATE_PATH = ".obsidian/plugins/obsidian-sync/state.json";
 
@@ -67,12 +80,20 @@ function localAwarenessCursorExtension(session: YjsSession): Extension {
 
 function mergeSettings(data: unknown): PluginSettings {
   const input = (data && typeof data === "object") ? data as Partial<PluginSettings> : {};
-  return ensureDeviceId({ ...DEFAULT_SETTINGS, ...input, configSync: { ...DEFAULT_SETTINGS.configSync, ...(input.configSync ?? {}) } });
+  return ensureDeviceId({
+    ...DEFAULT_SETTINGS,
+    ...input,
+    contentEncryption: { ...DEFAULT_SETTINGS.contentEncryption, ...(input.contentEncryption ?? {}) },
+    configSync: { ...DEFAULT_SETTINGS.configSync, ...(input.configSync ?? {}) },
+  });
 }
 
-function decodeBase64(data: string): string {
-  if (typeof Buffer !== "undefined") return Buffer.from(data, "base64").toString("utf8");
-  return decodeURIComponent(escape(atob(data)));
+function decodeBase64Bytes(data: string): Uint8Array {
+  if (typeof Buffer !== "undefined") return new Uint8Array(Buffer.from(data, "base64"));
+  const binary = atob(data);
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) out[i] = binary.charCodeAt(i);
+  return out;
 }
 
 class ObsidianAdapterStore implements PluginAdapter {
@@ -135,6 +156,7 @@ export default class ObsidianSyncPlugin extends Plugin {
   private presenceEl: HTMLElement | null = null;
   private activeFileId: string | null = null;
   private activeOpenToken = 0;
+  private contentEncryptionKey: VaultContentKey | null = null;
   private activeAwarenessCleanup: (() => void) | null = null;
   private readonly yjsEditorExtensions: Extension[] = [];
 
@@ -146,6 +168,8 @@ export default class ObsidianSyncPlugin extends Plugin {
     await this.index.load();
     this.transport = new SyncTransport(this.settings.serverUrl);
     this.yjsManager = new YjsSessionManager(this.transport, {
+      canPromote: () => !this.settings.contentEncryption.enabled,
+      promoteDisabledReason: "Realtime collaboration is disabled while vault content encryption is enabled",
       onSessionChanged: (fileId, session) => {
         if (this.activeFileId === fileId) this.setYjsEditorSession(session);
       },
@@ -155,7 +179,7 @@ export default class ObsidianSyncPlugin extends Plugin {
       onState: (state, detail) => this.setStatus(detail ? `${state}: ${detail}` : state),
       onConflict: (conflict) => { this.conflictStore.upsert(conflict); new Notice("Sync conflict requires manual resolution"); },
       onError: (error) => new Notice(`Sync error: ${error.message}`),
-    }, this.yjsManager);
+    }, this.yjsManager, () => this.contentEncryptionKey);
     const ignore = new SyncIgnore({ common: parseIgnoreLines(this.settings.commonIgnore), local: [...parseIgnoreLines(this.settings.localIgnore), ...localConfigIgnorePatterns(this.settings)] });
     this.watcher = new VaultWatcher(vaultIO, this.index, this.engine, ignore);
     this.statusEl = this.addStatusBarItem();
@@ -168,10 +192,11 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.registerEditorExtension(this.yjsEditorExtensions);
     this.registerCommands();
     this.registerVaultEvents();
+    if (this.settings.contentEncryption.enabled && !this.contentEncryptionKey) new Notice("Vault content encryption is enabled. Enter the passphrase in sync settings before syncing content.");
     this.engine.start();
     if (this.settings.syncOnStartup && !this.settings.paused) {
       if (this.index.device.appliedSeq === 0 && this.index.files.length === 0) {
-        void new InitialSyncRunner(this.transport, this.index, vaultIO, this.settings.vaultId).run()
+        void new InitialSyncRunner(this.transport, this.index, vaultIO, this.settings.vaultId, () => this.contentEncryptionKey).run()
           .catch((error: unknown) => new Notice(`Initial sync failed: ${error instanceof Error ? error.message : String(error)}`));
       } else {
         await this.watcher.reconcile();
@@ -185,6 +210,27 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.setYjsEditorSession(null);
     if (fileId) await this.yjsManager.leaveFile(fileId);
     await this.engine?.stop();
+  }
+
+  encryptionUnlocked(): boolean { return !this.settings.contentEncryption.enabled || this.contentEncryptionKey !== null; }
+
+  async configureContentEncryption(passphrase: string, enabled: boolean): Promise<void> {
+    if (!enabled) {
+      if (this.settings.contentEncryption.salt && this.settings.contentEncryption.verifier) {
+        const salt = base64ToBytes(this.settings.contentEncryption.salt);
+        if (!(await verifyEncryptionPassphrase(passphrase, salt, this.settings.contentEncryption.verifier))) throw new Error("Encryption passphrase did not match the stored verifier");
+      }
+      this.contentEncryptionKey = null;
+      this.settings.contentEncryption = { enabled: false };
+      await this.saveSettingsAndRestart();
+      return;
+    }
+    const salt = this.settings.contentEncryption.salt ? base64ToBytes(this.settings.contentEncryption.salt) : randomEncryptionSalt();
+    const verifier = this.settings.contentEncryption.verifier ?? await createEncryptionVerifier(passphrase, salt);
+    if (!(await verifyEncryptionPassphrase(passphrase, salt, verifier))) throw new Error("Encryption passphrase did not match the stored verifier");
+    this.contentEncryptionKey = await deriveVaultContentKey(passphrase, salt);
+    this.settings.contentEncryption = { enabled: true, salt: bytesToBase64(salt), verifier };
+    await this.saveSettingsAndRestart();
   }
 
   async saveSettingsOnly(): Promise<void> { await this.saveData(this.settings); }
@@ -349,7 +395,15 @@ export default class ObsidianSyncPlugin extends Plugin {
     const wait = this.transport.waitFor("content", (msg) => msg.hash === hash);
     this.transport.send({ t: "get_content", hash });
     const msg = await wait;
-    return msg.data ? decodeBase64(msg.data) : "";
+    if (!msg.data) return "";
+    let bytes = decodeBase64Bytes(msg.data);
+    if ((await contentHash(bytes)) !== hash) throw new Error(`Hash verification failed for ${hash}`);
+    if (this.settings.contentEncryption.enabled) {
+      if (!isEncryptedBlobEnvelope(bytes)) throw new Error(`Unsupported encrypted content format for ${hash}`);
+      if (!this.contentEncryptionKey) throw new Error("Vault content encryption is enabled but no passphrase has been unlocked for this session");
+      bytes = await decryptVaultBytes(bytes, this.contentEncryptionKey);
+    }
+    return new TextDecoder().decode(bytes);
   }
 
   private setStatus(text: string): void { if (this.statusEl) this.statusEl.setText(`Sync: ${text}`); }

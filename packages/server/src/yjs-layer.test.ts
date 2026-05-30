@@ -1,6 +1,6 @@
 import * as Y from 'yjs';
 import { describe, expect, it } from 'vitest';
-import { contentHashText, type ServerMessage } from '@obsidian-sync/shared';
+import { CONTENT_ENCRYPTION_ENCODING, contentHashText, type ServerMessage } from '@obsidian-sync/shared';
 import { OpProcessor } from './engine/op-processor.js';
 import { RoomManager, type RoomSink } from './engine/room-manager.js';
 import { InMemoryDataStore } from './engine/store.js';
@@ -68,6 +68,16 @@ describe('Yjs Layer 2 room manager', () => {
     expect(room).toMatchObject({ active: true, leaseOwner: deviceId, epoch: 1, nextSeq: 1 });
     expect(room?.leaseUntil?.getTime()).toBeGreaterThan(Date.now());
     expect(textFromSnapshot(Buffer.from(state.yjsSnapshot, 'base64'))).toBe('hello');
+  });
+
+  it('rejects Layer 2 promote for encrypted content', async () => {
+    const { processor, store, manager } = setup();
+    await createNote(processor);
+    const file = await store.getFile(vaultId, fileId);
+    expect(file).not.toBeNull();
+    await store.saveFile({ ...file!, contentEncoding: CONTENT_ENCRYPTION_ENCODING });
+
+    await expect(manager.promote(vaultId, fileId, deviceId, userId, new FakeSink(deviceId))).rejects.toThrow(/encrypted content/);
   });
 
 

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { AppliedOp, ConflictRecord, FileOp, FileType, ManifestEntry, ResultingClocks } from '@obsidian-sync/shared';
+import type { AppliedOp, ConflictRecord, ContentEncryptionEncoding, FileOp, FileType, ManifestEntry, ResultingClocks } from '@obsidian-sync/shared';
 import { caseFoldPath, type PathClock, type VersionVector } from '@obsidian-sync/shared';
 
 export type Role = 'owner' | 'editor' | 'viewer';
@@ -26,6 +26,7 @@ export interface StoredFile {
   contentHash: string | null;
   size: number | null;
   blobRef: string | null;
+  contentEncoding: ContentEncryptionEncoding | null;
   deleteVV: VersionVector | null;
   deleted: boolean;
   deletedAt: Date | null;
@@ -193,7 +194,7 @@ export class InMemoryDataStore implements OpDataStore {
 }
 
 export function toManifestEntry(file: StoredFile): ManifestEntry {
-  return { fileId: file.fileId, type: file.type, path: file.path, contentHash: file.contentHash, size: file.size, blobRef: file.blobRef, contentVV: file.contentVV, pathClock: file.pathClock, epoch: file.epoch, deleted: file.deleted };
+  return { fileId: file.fileId, type: file.type, path: file.path, contentHash: file.contentHash, size: file.size, blobRef: file.blobRef, contentEncoding: file.contentEncoding, contentVV: file.contentVV, pathClock: file.pathClock, epoch: file.epoch, deleted: file.deleted };
 }
 
 export function newStoredFile(op: FileOp, path: string, pathClock: PathClock): StoredFile {
@@ -208,6 +209,7 @@ export function newStoredFile(op: FileOp, path: string, pathClock: PathClock): S
     contentHash: op.contentHash ?? op.blobRef ?? null,
     size: op.size ?? null,
     blobRef: op.blobRef ?? null,
+    contentEncoding: op.contentEncoding ?? null,
     deleteVV: null,
     deleted: false,
     deletedAt: null,

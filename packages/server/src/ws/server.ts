@@ -117,7 +117,7 @@ export class SyncWebSocketServer {
       case 'resolve_conflict': send(socket, { t: 'conflict', conflict: await this.conflicts.resolve({ conflictId: msg.conflictId, deviceId: state.deviceId!, resolvedHash: msg.resolvedHash, inlineText: msg.inlineText, resolvedVV: msg.resolvedVV }) }); break;
       case 'get_manifest': send(socket, await this.manifest.page(msg.vaultId, msg.cursor)); break;
       case 'get_content': {
-        const bytes = await this.manifest.getContent(msg.hash);
+        const bytes = await this.manifest.getContent(msg.hash) ?? await this.blobs.getBytes(msg.hash);
         send(socket, { t: 'content', hash: msg.hash, data: bytes ? Buffer.from(bytes).toString('base64') : null });
         break;
       }
