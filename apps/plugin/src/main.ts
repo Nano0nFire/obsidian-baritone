@@ -1,10 +1,13 @@
 import { Notice, Plugin, TFile, type DataAdapter } from "obsidian";
+import type { Extension } from "@codemirror/state";
+import { yCollab } from "y-codemirror.next";
 import { DEFAULT_SETTINGS, ensureDeviceId, parseIgnoreLines, type PluginSettings } from "./settings.js";
 import { ObsidianSyncSettingTab } from "./settings-tab.js";
 import { LocalIndexStore, type PluginAdapter } from "./localindex/index.js";
 import { SyncIgnore } from "./ignore/ignore.js";
 import { SyncTransport } from "./sync/transport.js";
 import { SyncEngine } from "./sync/engine.js";
+import { YjsSessionManager, type YjsSession } from "./sync/yjs-session.js";
 import { InitialSyncRunner } from "./sync/initial-sync.js";
 import { VaultWatcher } from "./watcher/vault-watcher.js";
 import { ConflictStore } from "./conflict/conflict-store.js";
@@ -79,10 +82,13 @@ export default class ObsidianSyncPlugin extends Plugin {
   private index!: LocalIndexStore;
   private transport!: SyncTransport;
   private engine!: SyncEngine;
+  private yjsManager!: YjsSessionManager;
   private watcher!: VaultWatcher;
   private conflictStore = new ConflictStore();
   private statusEl: HTMLElement | null = null;
   private activeFileId: string | null = null;
+  private activeOpenToken = 0;
+  private readonly yjsEditorExtensions: Extension[] = [];
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -91,18 +97,24 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.index = new LocalIndexStore(adapterStore, STATE_PATH, this.settings.deviceId);
     await this.index.load();
     this.transport = new SyncTransport(this.settings.serverUrl);
+    this.yjsManager = new YjsSessionManager(this.transport, {
+      onSessionChanged: (fileId, session) => {
+        if (this.activeFileId === fileId) this.setYjsEditorSession(session);
+      },
+    });
     const vaultIO = new ObsidianVaultIO(this);
     this.engine = new SyncEngine(this.settings, this.index, vaultIO, this.transport, {
       onState: (state, detail) => this.setStatus(detail ? `${state}: ${detail}` : state),
       onConflict: (conflict) => { this.conflictStore.upsert(conflict); new Notice("Sync conflict requires manual resolution"); },
       onError: (error) => new Notice(`Sync error: ${error.message}`),
-    });
+    }, this.yjsManager);
     const ignore = new SyncIgnore({ common: parseIgnoreLines(this.settings.commonIgnore), local: [...parseIgnoreLines(this.settings.localIgnore), ...localConfigIgnorePatterns(this.settings)] });
     this.watcher = new VaultWatcher(vaultIO, this.index, this.engine, ignore);
     this.statusEl = this.addStatusBarItem();
     this.setStatus(this.settings.paused ? "paused" : "loading");
     this.addSettingTab(new ObsidianSyncSettingTab(this.app, this));
     this.registerView(VIEW_TYPE_CONFLICTS, (leaf) => new ConflictPanel(leaf, this.conflictStore, this.transport, (conflict) => void this.openMerge(conflict)));
+    this.registerEditorExtension(this.yjsEditorExtensions);
     this.registerCommands();
     this.registerVaultEvents();
     this.engine.start();
@@ -117,7 +129,10 @@ export default class ObsidianSyncPlugin extends Plugin {
   }
 
   override async onunload(): Promise<void> {
-    if (this.activeFileId) this.engine.demote(this.activeFileId);
+    const fileId = this.activeFileId;
+    this.activeFileId = null;
+    this.setYjsEditorSession(null);
+    if (fileId) await this.yjsManager.leaveFile(fileId);
     await this.engine?.stop();
   }
 
@@ -148,12 +163,43 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("modify", (file) => { if (file instanceof TFile) this.watcher.queuePath(file.path); }));
     this.registerEvent(this.app.vault.on("delete", (file) => { if (file instanceof TFile) void this.watcher.handleDelete(file.path); }));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => { if (file instanceof TFile) void this.watcher.handleRename(oldPath, file.path); }));
-    this.registerEvent(this.app.workspace.on("file-open", (file) => {
-      if (this.activeFileId) this.engine.demote(this.activeFileId);
-      const entry = file instanceof TFile ? this.index.byPath(file.path) : undefined;
-      this.activeFileId = entry?.fileId ?? null;
-      if (this.activeFileId) this.engine.promote(this.activeFileId);
-    }));
+    this.registerEvent(this.app.workspace.on("file-open", (file) => { void this.activateRealtimeFile(file instanceof TFile ? file : null); }));
+    this.registerEvent(this.app.workspace.on("active-leaf-change", () => { void this.activateRealtimeFile(this.app.workspace.getActiveFile()); }));
+  }
+
+  private async activateRealtimeFile(file: TFile | null): Promise<void> {
+    const token = ++this.activeOpenToken;
+    const previous = this.activeFileId;
+    const entry = file?.extension === "md" ? this.index.byPath(file.path) : undefined;
+    const nextFileId = entry?.fileId ?? null;
+    if (previous && previous !== nextFileId) {
+      this.activeFileId = null;
+      this.setYjsEditorSession(null);
+      await this.yjsManager.leaveFile(previous);
+    }
+    if (!nextFileId) {
+      this.activeFileId = null;
+      this.setYjsEditorSession(null);
+      return;
+    }
+    if (previous === nextFileId && this.yjsManager.hasSession(nextFileId)) return;
+    this.activeFileId = nextFileId;
+    try {
+      const session = await this.yjsManager.openFile(nextFileId);
+      if (token !== this.activeOpenToken || this.activeFileId !== nextFileId) return;
+      this.setYjsEditorSession(session);
+    } catch (error) {
+      if (token === this.activeOpenToken) {
+        this.activeFileId = null;
+        this.setYjsEditorSession(null);
+        new Notice(`Realtime sync failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+  }
+
+  private setYjsEditorSession(session: YjsSession | null): void {
+    this.yjsEditorExtensions.splice(0, this.yjsEditorExtensions.length, ...(session ? [yCollab(session.text, session.awareness)] : []));
+    this.app.workspace.updateOptions();
   }
 
   private async activateConflictsView(): Promise<void> {

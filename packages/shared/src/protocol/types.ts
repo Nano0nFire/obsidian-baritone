@@ -115,6 +115,38 @@ export interface GetOpsMessage {
 export interface PromoteMessage { t: 'promote'; fileId: string }
 export interface DemoteMessage { t: 'demote'; fileId: string }
 
+// --- Layer 2 (Yjs realtime) client → server ---
+/** A local Yjs document update to persist and relay. */
+export interface YjsUpdateMessage {
+  t: 'yjs_update';
+  fileId: string;
+  roomEpoch: number;
+  /** Client-monotonic id (per room) used to correlate the durability ack. */
+  updateId: number;
+  /** base64-encoded Yjs update. */
+  update: string;
+}
+/** Ephemeral presence/cursor state to relay (never persisted). */
+export interface YjsAwarenessMessage {
+  t: 'yjs_awareness';
+  fileId: string;
+  roomEpoch: number;
+  /** base64-encoded y-protocols awareness update. */
+  state: string;
+}
+/** Request the missing-updates diff after a reconnect. */
+export interface YjsSyncMessage {
+  t: 'yjs_sync';
+  fileId: string;
+  roomEpoch: number;
+  /** base64-encoded Yjs state vector of the client's current doc. */
+  stateVector: string;
+}
+/** Renew room liveness (lease) without re-seeding. */
+export interface YjsHeartbeatMessage { t: 'yjs_heartbeat'; fileId: string; roomEpoch: number }
+/** Leave the room; server may begin closing if no participants remain. */
+export interface LeaveRoomMessage { t: 'leave_room'; fileId: string; roomEpoch: number }
+
 export interface BlobUploadInitMessage {
   t: 'blob_upload_init';
   fileId?: string;
@@ -147,6 +179,11 @@ export type ClientMessage =
   | GetOpsMessage
   | PromoteMessage
   | DemoteMessage
+  | YjsUpdateMessage
+  | YjsAwarenessMessage
+  | YjsSyncMessage
+  | YjsHeartbeatMessage
+  | LeaveRoomMessage
   | BlobUploadInitMessage
   | BlobUploadCompleteMessage
   | ClaimConflictMessage
@@ -212,10 +249,52 @@ export interface ConflictStateMessage {
 export interface RoomStateMessage {
   t: 'room_state';
   fileId: string;
+  /** Monotonic incarnation id of the room; changes on each promote-from-dormant. */
+  roomEpoch: number;
   /** base64 Yjs snapshot. */
   yjsSnapshot: string;
   /** base64 Yjs state vector. */
   stateVector: string;
+}
+
+// --- Layer 2 (Yjs realtime) server → client ---
+/** A relayed peer update or a diff in response to yjs_sync. */
+export interface YjsRelayUpdateMessage {
+  t: 'yjs_update';
+  fileId: string;
+  roomEpoch: number;
+  /** Server-assigned monotonic sequence within the room incarnation. */
+  seq: number;
+  /** base64-encoded Yjs update. */
+  update: string;
+}
+/** Durability acknowledgement for a client-sent yjs_update. */
+export interface YjsAckMessage {
+  t: 'yjs_ack';
+  fileId: string;
+  roomEpoch: number;
+  /** Echoes the client's updateId. */
+  updateId: number;
+  /** Server-assigned sequence the update was persisted at. */
+  seq: number;
+}
+/** Relayed awareness/presence from a peer. */
+export interface YjsAwarenessRelayMessage {
+  t: 'yjs_awareness';
+  fileId: string;
+  roomEpoch: number;
+  from: string;
+  state: string;
+}
+export type RoomClosedReason = 'demoted' | 'lease_expired' | 'deleted' | 'evicted' | 'epoch_stale';
+/** The room incarnation has ended; the client must rebind to Layer 1. */
+export interface RoomClosedMessage {
+  t: 'room_closed';
+  fileId: string;
+  roomEpoch: number;
+  reason: RoomClosedReason;
+  /** Final content hash flushed to Layer 1 (when reason='demoted'). */
+  finalHash?: string;
 }
 
 export interface ManifestPageMessage {
@@ -261,6 +340,10 @@ export type ServerMessage =
   | ConflictMessage
   | ConflictStateMessage
   | RoomStateMessage
+  | YjsRelayUpdateMessage
+  | YjsAckMessage
+  | YjsAwarenessRelayMessage
+  | RoomClosedMessage
   | ManifestPageMessage
   | ContentMessage
   | TrashListMessage

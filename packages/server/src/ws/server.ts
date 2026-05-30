@@ -7,11 +7,11 @@ import { OpProcessor } from '../engine/op-processor.js';
 import { ConflictService } from '../engine/conflict.js';
 import { ManifestService } from '../engine/manifest.js';
 import { TrashService } from '../engine/trash.js';
-import { YjsLayerService } from '../engine/yjs.js';
+import { RoomManager, type RoomSink } from '../engine/room-manager.js';
 import type { OpDataStore } from '../engine/store.js';
 import { clientMessageSchema, type ValidatedClientMessage } from './validation.js';
 
-interface ConnectionState { claims?: AccessClaims; vaultId?: string; deviceId?: string }
+interface ConnectionState { claims?: AccessClaims; vaultId?: string; deviceId?: string; queue?: Promise<void> }
 
 export class SyncWebSocketServer {
   readonly wss: WebSocketServer;
@@ -25,7 +25,7 @@ export class SyncWebSocketServer {
     private readonly manifest: ManifestService,
     private readonly trash: TrashService,
     private readonly blobs: BlobStore,
-    private readonly yjs: YjsLayerService,
+    private readonly rooms: RoomManager,
   ) {
     this.wss = new WebSocketServer({ server });
     this.wss.on('connection', (socket) => this.handleConnection(socket));
@@ -39,9 +39,15 @@ export class SyncWebSocketServer {
     const state: ConnectionState = {};
     const client = { socket, state };
     this.clients.add(client);
-    socket.on('close', () => this.clients.delete(client));
+    socket.on('close', () => {
+      this.clients.delete(client);
+      if (state.deviceId) this.rooms.disconnect(state.deviceId).catch((error) => console.error('[ws] room disconnect failed', error));
+    });
     socket.on('message', (raw) => {
-      void this.handleMessage(socket, state, raw.toString()).catch((error) => send(socket, errorToWire(error)));
+      const payload = raw.toString();
+      state.queue = (state.queue ?? Promise.resolve())
+        .then(() => this.handleMessage(socket, state, payload))
+        .catch((error) => send(socket, errorToWire(error)));
     });
   }
 
@@ -56,7 +62,10 @@ export class SyncWebSocketServer {
         if (msg.op.deviceId !== state.deviceId || msg.op.vaultId !== state.vaultId) throw new SyncError(ErrorCode.UNAUTHENTICATED, 'Operation device/vault must match the authenticated connection');
         const result = await this.opProcessor.process(msg.op, state.claims!.userId);
         send(socket, result.type === 'ack' ? { t: 'op_ack', opId: result.opId, vaultSeq: result.vaultSeq, resultingClocks: result.resultingClocks, conflictId: result.conflictId } : { t: 'reject', opId: result.opId, code: result.code, message: result.message, details: result.details });
-        if (result.type === 'ack') this.broadcastOps(state.vaultId!, socket, [{ vaultSeq: result.vaultSeq, op: msg.op, resultingClocks: result.resultingClocks }]);
+        if (result.type === 'ack') {
+          this.broadcastOps(state.vaultId!, socket, [{ vaultSeq: result.vaultSeq, op: msg.op, resultingClocks: result.resultingClocks }]);
+          if (msg.op.kind === 'delete') await this.rooms.closeDeleted(state.vaultId!, msg.op.fileId);
+        }
         break;
       }
       case 'get_ops': {
@@ -77,16 +86,20 @@ export class SyncWebSocketServer {
       }
       case 'list_trash': send(socket, { t: 'trash_list', items: await this.trash.list(msg.vaultId) }); break;
       case 'promote': {
-        const room = await this.yjs.promote(state.vaultId!, msg.fileId, state.deviceId!, state.claims!.userId);
-        send(socket, { t: 'room_state', fileId: msg.fileId, yjsSnapshot: Buffer.from(room.snapshot ?? new Uint8Array()).toString('base64'), stateVector: Buffer.from(room.stateVector ?? new Uint8Array()).toString('base64') });
+        send(socket, await this.rooms.promote(state.vaultId!, msg.fileId, state.deviceId!, state.claims!.userId, sinkFor(socket, state.deviceId!)));
         break;
       }
-      case 'demote': await this.yjs.demote(state.vaultId!, msg.fileId, state.deviceId!, state.claims!.userId); send(socket, { t: 'room_state', fileId: msg.fileId, yjsSnapshot: '', stateVector: '' }); break;
+      case 'demote': await this.rooms.demote(state.vaultId!, msg.fileId, state.deviceId!); break;
+      case 'yjs_update': await this.rooms.handleUpdate({ vaultId: state.vaultId!, fileId: msg.fileId, deviceId: state.deviceId!, userId: state.claims!.userId, roomEpoch: msg.roomEpoch, updateId: msg.updateId, update: msg.update }); break;
+      case 'yjs_awareness': await this.rooms.handleAwareness({ vaultId: state.vaultId!, fileId: msg.fileId, deviceId: state.deviceId!, roomEpoch: msg.roomEpoch, state: msg.state }); break;
+      case 'yjs_sync': await this.rooms.handleSync({ vaultId: state.vaultId!, fileId: msg.fileId, deviceId: state.deviceId!, roomEpoch: msg.roomEpoch, stateVector: msg.stateVector }); break;
+      case 'yjs_heartbeat': await this.rooms.heartbeat(state.vaultId!, msg.fileId, state.deviceId!, msg.roomEpoch); break;
+      case 'leave_room': await this.rooms.leave(state.vaultId!, msg.fileId, state.deviceId!, msg.roomEpoch); break;
       case 'restore': throw new SyncError(ErrorCode.UNSUPPORTED, 'Use file_op restore so device_seq/idempotency are preserved');
     }
   }
 
-  private broadcastOps(vaultId: string, source: WebSocket, ops: AppliedOp[]): void {
+  broadcastOps(vaultId: string, source: WebSocket | null, ops: AppliedOp[]): void {
     for (const client of this.clients) {
       if (client.socket !== source && client.state.vaultId === vaultId) send(client.socket, { t: 'ops', ops, more: false });
     }
@@ -97,10 +110,14 @@ export class SyncWebSocketServer {
     const claims = await this.tokens.verifyAccess(msg.token);
     if (claims.deviceId !== msg.deviceId || claims.vaultId !== msg.vaultId) throw new SyncError(ErrorCode.UNAUTHENTICATED, 'Token/device/vault mismatch');
     state.claims = claims; state.deviceId = msg.deviceId; state.vaultId = msg.vaultId;
-    send(socket, { t: 'welcome', serverTime: Date.now(), currentSeq: await this.store.currentSeq(msg.vaultId), serverProtocol: PROTOCOL_VERSION, minClientProtocol: MIN_CLIENT_PROTOCOL, capabilities: ['layer1', 'blob-presign', 'manifest-v1', 'conflict-v1', 'yjs-lease-v1'] });
+    send(socket, { t: 'welcome', serverTime: Date.now(), currentSeq: await this.store.currentSeq(msg.vaultId), serverProtocol: PROTOCOL_VERSION, minClientProtocol: MIN_CLIENT_PROTOCOL, capabilities: ['layer1', 'blob-presign', 'manifest-v1', 'conflict-v1', 'yjs-lease-v1', 'yjs-realtime'] });
     const ops = await this.store.listOps(msg.vaultId, msg.lastSeq, 1000);
     if (ops.length) send(socket, { t: 'ops', ops, more: ops.length === 1000 });
   }
+}
+
+function sinkFor(socket: WebSocket, deviceId: string): RoomSink {
+  return { deviceId, send: (message) => send(socket, message), isBackpressured: () => socket.bufferedAmount > 1_000_000 };
 }
 
 function send(socket: WebSocket, message: ServerMessage): void {

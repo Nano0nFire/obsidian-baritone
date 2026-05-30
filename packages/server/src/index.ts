@@ -10,7 +10,8 @@ import { OpProcessor } from './engine/op-processor.js';
 import { ConflictService } from './engine/conflict.js';
 import { ManifestService } from './engine/manifest.js';
 import { TrashService } from './engine/trash.js';
-import { InMemoryYjsRoomStore, YjsLayerService } from './engine/yjs.js';
+import { PgYjsRoomStore } from './engine/yjs.js';
+import { RoomManager } from './engine/room-manager.js';
 import { SyncWebSocketServer } from './ws/server.js';
 
 export async function startServer(): Promise<{ close(): Promise<void> }> {
@@ -25,7 +26,10 @@ export async function startServer(): Promise<{ close(): Promise<void> }> {
   const conflicts = new ConflictService(data);
   const manifest = new ManifestService(data);
   const trash = new TrashService(data, opProcessor, config.TRASH_RETENTION_DAYS);
-  const yjs = new YjsLayerService(data, new InMemoryYjsRoomStore());
+  const wsRef: { current?: SyncWebSocketServer } = {};
+  const rooms = new RoomManager(data, new PgYjsRoomStore(db), opProcessor, {
+    broadcastVault: (vaultId, _sourceDeviceId, ops) => wsRef.current?.broadcastOps(vaultId, null, ops),
+  });
 
   const server = http.createServer((req, res) => {
     if (req.url === '/healthz') {
@@ -36,7 +40,8 @@ export async function startServer(): Promise<{ close(): Promise<void> }> {
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'not_found' }));
   });
-  const ws = new SyncWebSocketServer(server, data, tokens, opProcessor, conflicts, manifest, trash, blobStore, yjs);
+  const ws = new SyncWebSocketServer(server, data, tokens, opProcessor, conflicts, manifest, trash, blobStore, rooms);
+  wsRef.current = ws;
   await new Promise<void>((resolve) => server.listen(config.SERVER_PORT, resolve));
   console.log(JSON.stringify({ event: 'server_started', port: config.SERVER_PORT, publicUrl: config.PUBLIC_URL }));
   return {

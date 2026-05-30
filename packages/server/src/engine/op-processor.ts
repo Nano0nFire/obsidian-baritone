@@ -9,26 +9,29 @@ export class OpProcessor {
       const existing = await tx.getOpById(op.opId);
       if (existing) return existing.result;
 
-      const device = await tx.getDevice(op.deviceId);
-      if (!device || device.vaultId !== op.vaultId) return reject(op.opId, ErrorCode.UNAUTHENTICATED, 'Unknown device for vault');
-      if (device.revoked) return reject(op.opId, ErrorCode.DEVICE_REVOKED, 'Device is revoked');
-      if (userId) {
-        const role = await tx.getRole(op.vaultId, userId);
-        if (role !== 'owner' && role !== 'editor') return reject(op.opId, ErrorCode.FORBIDDEN, 'Write permission required');
-      }
+      const syntheticCollab = op.deviceId === `collab:${op.fileId}`;
+      const device = syntheticCollab ? null : await tx.getDevice(op.deviceId);
+      if (!syntheticCollab) {
+        if (!device || device.vaultId !== op.vaultId) return reject(op.opId, ErrorCode.UNAUTHENTICATED, 'Unknown device for vault');
+        if (device.revoked) return reject(op.opId, ErrorCode.DEVICE_REVOKED, 'Device is revoked');
+        if (userId) {
+          const role = await tx.getRole(op.vaultId, userId);
+          if (role !== 'owner' && role !== 'editor') return reject(op.opId, ErrorCode.FORBIDDEN, 'Write permission required');
+        }
 
-      const expected = device.lastDeviceSeq + 1;
-      if (op.deviceSeq < expected) {
-        const prior = await tx.getOpByDeviceSeq(op.deviceId, op.deviceSeq);
-        return prior?.result ?? reject(op.opId, ErrorCode.STALE, 'Device sequence already processed', { expected });
+        const expected = device.lastDeviceSeq + 1;
+        if (op.deviceSeq < expected) {
+          const prior = await tx.getOpByDeviceSeq(op.deviceId, op.deviceSeq);
+          return prior?.result ?? reject(op.opId, ErrorCode.STALE, 'Device sequence already processed', { expected });
+        }
+        if (op.deviceSeq > expected) return reject(op.opId, ErrorCode.SEQ_GAP, 'Device sequence gap', { expected });
       }
-      if (op.deviceSeq > expected) return reject(op.opId, ErrorCode.SEQ_GAP, 'Device sequence gap', { expected });
 
       try {
         await validatePayload(op, tx);
         let file = await tx.getFile(op.vaultId, op.fileId);
         const contentOp = op.kind === 'create' || op.kind === 'update' || op.kind === 'restore';
-        if (file?.activeUntil && file.activeUntil > new Date() && contentOp) throw new SyncError(ErrorCode.FILE_ACTIVE, 'File is active in Layer 2', { hint: 'promote' });
+        if (!syntheticCollab && file?.activeUntil && file.activeUntil > new Date() && contentOp) throw new SyncError(ErrorCode.FILE_ACTIVE, 'File is active in Layer 2', { hint: 'promote' });
         if (file?.conflictId && contentOp) throw new SyncError(ErrorCode.CONFLICT_PENDING, 'Content operations are frozen until conflict resolution');
 
         let conflictId: string | undefined;
@@ -47,7 +50,7 @@ export class OpProcessor {
         await tx.appendOp(storedOp);
         const applied: AppliedOp = { vaultSeq: seq, op, resultingClocks };
         await tx.appendOutbox(op.vaultId, seq, applied);
-        await tx.saveDevice({ ...device, lastDeviceSeq: op.deviceSeq, lastSeq: seq, lastSeen: new Date() } as typeof device & { lastSeen: Date });
+        if (device) await tx.saveDevice({ ...device, lastDeviceSeq: op.deviceSeq, lastSeq: seq, lastSeen: new Date() });
         return result;
       } catch (error) {
         if (error instanceof SyncError) return reject(op.opId, error.code, error.message, error.details);

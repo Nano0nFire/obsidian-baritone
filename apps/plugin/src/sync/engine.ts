@@ -23,6 +23,7 @@ import type { LocalIndexStore } from "../localindex/index.js";
 import { OutboxManager, type FileOpDraft } from "./outbox.js";
 import type { SyncTransport, TransportState } from "./transport.js";
 import type { VaultIO } from "./vault-io.js";
+import type { YjsSessionManager } from "./yjs-session.js";
 import { isTextPath } from "../pathing.js";
 import { shouldApplyConfigPath } from "../configsync/configsync.js";
 
@@ -54,6 +55,7 @@ export class SyncEngine {
     private readonly vault: VaultIO,
     private readonly transport: SyncTransport,
     private readonly hooks: EngineHooks = {},
+    private readonly yjs?: YjsSessionManager,
   ) {
     this.outbox = new OutboxManager(settings.deviceId, index.device.nextDeviceSeq, index.device.outbox);
   }
@@ -128,6 +130,11 @@ export class SyncEngine {
   promote(fileId: string): void { this.transport.send({ t: "promote", fileId }); }
   demote(fileId: string): void { this.transport.send({ t: "demote", fileId }); }
   requestResync(): void { this.transport.send({ t: "get_ops", sinceSeq: this.index.device.appliedSeq }); }
+  isRealtimeActiveFile(fileId: string): boolean { return this.yjs?.hasSession(fileId) ?? false; }
+  isRealtimeActivePath(path: string): boolean {
+    const entry = this.index.byPath(path);
+    return entry ? this.isRealtimeActiveFile(entry.fileId) : false;
+  }
 
   private handleTransportState(state: TransportState): void {
     if (this.settings.paused) return;
@@ -144,11 +151,13 @@ export class SyncEngine {
         capabilities: ["layer1", "manual-conflicts", "promote-demote"],
       });
       this.flushOutbox();
+      this.yjs?.handleTransportOpen();
     } else if (state === "connecting") this.setState("connecting");
   }
 
   private async handleMessage(message: ServerMessage): Promise<void> {
     try {
+      if (await this.yjs?.handleMessage(message)) return;
       switch (message.t) {
         case "welcome":
           if (message.currentSeq > this.index.device.appliedSeq) this.transport.send({ t: "get_ops", sinceSeq: this.index.device.appliedSeq });
@@ -176,6 +185,13 @@ export class SyncEngine {
           }
           break;
         case "error":
+          if (message.code === ErrorCode.ROOM_EPOCH_STALE) {
+            const fileId = typeof message.details?.fileId === "string" ? message.details.fileId : undefined;
+            if (fileId && this.isRealtimeActiveFile(fileId)) {
+              void this.yjs?.resyncFile(fileId).catch((error: unknown) => this.hooks.onError?.(error instanceof Error ? error : new Error(String(error))));
+              break;
+            }
+          }
           throw new Error(`${message.code}: ${message.message}`);
       }
     } catch (error) {
@@ -248,7 +264,12 @@ export class SyncEngine {
       if (!target) return;
       const configDecision = shouldApplyConfigPath(target, this.settings);
       if (configDecision.category && !configDecision.applies) return;
-      if (op.inlineText !== undefined) {
+      const activeRealtime = this.yjs?.hasSession(op.fileId) && isTextPath(target);
+      if (activeRealtime) {
+        const text = op.inlineText ?? new TextDecoder().decode(await this.fetchContentBytes(op.contentHash));
+        const result = await this.yjs?.reconcileLayer1Content(op.fileId, text, op.contentHash);
+        if (!result?.active) await this.vault.writeText(target, text);
+      } else if (op.inlineText !== undefined) {
         await this.vault.writeText(target, op.inlineText);
       } else {
         await this.fetchAndWriteBlob(target, op.contentHash);
@@ -273,14 +294,19 @@ export class SyncEngine {
       const existing = await this.vault.readBytes(target);
       if ((await contentHash(existing)) === hash) return;
     }
+    const bytes = await this.fetchContentBytes(hash);
+    await this.vault.writeBytes(target, bytes);
+    this.index.device.downloadedHashes = [...new Set([...this.index.device.downloadedHashes, hash])];
+  }
+
+  private async fetchContentBytes(hash: string): Promise<Uint8Array> {
     const contentPromise = this.transport.waitFor("content", (msg): msg is ContentMessage => msg.hash === hash);
     this.transport.send({ t: "get_content", hash });
     const content = await contentPromise;
     if (content.data === null) throw new Error(`Content ${hash} unavailable; resync required`);
     const bytes = decodeBase64(content.data);
-    if ((await contentHash(bytes)) !== hash) throw new Error(`Hash verification failed for ${target}`);
-    await this.vault.writeBytes(target, bytes);
-    this.index.device.downloadedHashes = [...new Set([...this.index.device.downloadedHashes, hash])];
+    if ((await contentHash(bytes)) !== hash) throw new Error(`Hash verification failed for ${hash}`);
+    return bytes;
   }
 
   private async persistOutbox(): Promise<void> {

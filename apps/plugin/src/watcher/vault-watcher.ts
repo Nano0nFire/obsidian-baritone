@@ -24,7 +24,7 @@ export class VaultWatcher {
   queuePath(path: string): void {
     try {
       const canonical = canonicalVaultPath(path);
-      if (this.ignore.ignores(canonical)) return;
+      if (this.ignore.ignores(canonical) || this.engine.isRealtimeActivePath(canonical)) return;
       this.queued.add(canonical);
       if (this.timer) clearTimeout(this.timer);
       this.timer = setTimeout(() => void this.flush(), 750);
@@ -51,6 +51,7 @@ export class VaultWatcher {
     for (const item of plan.creates) await this.syncPath(item.path);
     for (const item of plan.updates) await this.syncPath(item.disk.path);
     for (const item of plan.deletes) {
+      if (this.engine.isRealtimeActiveFile(item.fileId)) continue;
       const entry = this.index.byFileId(item.fileId);
       await this.engine.enqueueLocalChange(this.engine.makeDeleteOp(item.fileId, entry?.type ?? "note"));
     }
@@ -62,18 +63,20 @@ export class VaultWatcher {
     if (this.ignore.ignores(newCanonical)) return;
     const entry = this.index.byPath(oldCanonical);
     if (!entry) return this.syncPath(newCanonical);
+    if (this.engine.isRealtimeActiveFile(entry.fileId)) return;
     await this.engine.enqueueLocalChange(this.engine.makeRenameOp(entry.fileId, newCanonical, entry.type));
   }
 
   async handleDelete(path: string): Promise<void> {
     const entry = this.index.byPath(canonicalVaultPath(path));
-    if (!entry) return;
+    if (!entry || this.engine.isRealtimeActiveFile(entry.fileId)) return;
     await this.engine.enqueueLocalChange(this.engine.makeDeleteOp(entry.fileId, entry.type));
   }
 
   private async syncPath(path: string): Promise<void> {
     if (this.ignore.ignores(path) || !this.vault.exists(path)) return;
     const entry = this.index.byPath(path);
+    if (entry && this.engine.isRealtimeActiveFile(entry.fileId)) return;
     const fileId = entry?.fileId ?? newFileId();
     const type = entry?.type ?? classify(path);
     const draft = await this.engine.makeContentOp(fileId, path, type);

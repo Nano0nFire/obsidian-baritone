@@ -24,6 +24,11 @@ export enum ErrorCode {
   CONFLICT_PENDING = 'CONFLICT_PENDING',
   NOT_FOUND = 'NOT_FOUND',
 
+  // --- layer 2 (yjs realtime rooms) ---
+  ROOM_NOT_FOUND = 'ROOM_NOT_FOUND',
+  ROOM_EPOCH_STALE = 'ROOM_EPOCH_STALE',
+  NOT_PARTICIPANT = 'NOT_PARTICIPANT',
+
   // --- quota / limits ---
   QUOTA_EXCEEDED = 'QUOTA_EXCEEDED',
   RATE_LIMITED = 'RATE_LIMITED',
@@ -61,5 +66,5 @@ export class SyncError extends Error {
 
 /** True for errors the client should retry after fetching missing ops. */
 export function isRecoverable(code: ErrorCode): boolean {
-  return code === ErrorCode.SEQ_GAP || code === ErrorCode.STALE || code === ErrorCode.RATE_LIMITED;
+  return code === ErrorCode.SEQ_GAP || code === ErrorCode.STALE || code === ErrorCode.RATE_LIMITED || code === ErrorCode.ROOM_EPOCH_STALE;
 }
