@@ -9,6 +9,7 @@ import { migrate } from '../../db/migrate.js';
 import { PgOpDataStore } from '../../db/pg-op-store.js';
 import { PgDatabase } from '../../db/pool.js';
 import { OpProcessor } from '../../engine/op-processor.js';
+import { ConflictService } from '../../engine/conflict.js';
 import { RoomManager, type RoomSink } from '../../engine/room-manager.js';
 import { PgYjsRoomStore } from '../../engine/yjs.js';
 
@@ -86,6 +87,39 @@ describe.skipIf(!integrationReady)('server integration: postgres, minio, and Lay
 
     const conflict = await data.getConflict(file!.conflictId!);
     expect(conflict).toMatchObject({ vaultId, fileId, status: 'open', oursHash: file?.contentHash, theirsVV: { [deviceId]: 1, [otherDeviceId]: 1 } });
+  });
+
+  it('resolves an attachment conflict: releases conflict_side FK pins and re-pins the chosen blob (real Postgres FKs)', async () => {
+    await migrate(db);
+    await seedIdentity(db);
+    const processor = new OpProcessor(data);
+    const ours = 'sha256:' + 'a'.repeat(64);
+    const theirs = 'sha256:' + 'b'.repeat(64);
+    for (const hash of [ours, theirs]) {
+      await data.saveBlob({ hash, size: 10, state: 'verified', objectKey: hash, createdAt: new Date(), verifiedAt: new Date(), unreferencedAt: null, deletedAt: null });
+    }
+
+    const create: FileOp = { opId: randomUUID(), deviceId, deviceSeq: 1, fileId, vaultId, kind: 'create', type: 'attachment', newPath: 'img.png', pathClock: { lamport: 1, deviceId }, newContentVV: { [deviceId]: 1 }, contentHash: ours, blobRef: ours, size: 10, schemaVersion: 1 };
+    expect(await processor.process(create, userId)).toMatchObject({ type: 'ack' });
+
+    const concurrent: FileOp = { opId: randomUUID(), deviceId: otherDeviceId, deviceSeq: 1, fileId, vaultId, kind: 'update', type: 'attachment', newContentVV: { [otherDeviceId]: 1 }, contentHash: theirs, blobRef: theirs, size: 10, schemaVersion: 1 };
+    const conflicted = await processor.process(concurrent, userId);
+    const conflictId = conflicted.type === 'ack' ? conflicted.conflictId! : '';
+    expect(conflictId).toBeTruthy();
+
+    expect(await data.listBlobRefs(ours)).toContainEqual({ hash: ours, refType: 'conflict_side', refId: `${conflictId}:ours` });
+    expect(await data.listBlobRefs(theirs)).toContainEqual({ hash: theirs, refType: 'conflict_side', refId: `${conflictId}:theirs` });
+
+    const conflicts = new ConflictService(data);
+    await conflicts.claim(conflictId, deviceId);
+    const resolved = await conflicts.resolve({ conflictId, deviceId, resolvedHash: theirs, resolvedVV: { [deviceId]: 2 } });
+    expect(resolved.status).toBe('resolved');
+
+    expect(await data.listBlobRefs(ours)).toEqual([]);
+    expect(await data.listBlobRefs(theirs)).toEqual([{ hash: theirs, refType: 'file_live', refId: fileId }]);
+
+    const resolvedFile = await data.getFile(vaultId, fileId);
+    expect(resolvedFile).toMatchObject({ contentHash: theirs, blobRef: theirs, size: 10, conflictId: null });
   });
 
   it('round-trips BlobStore uploads through MinIO with presigned PUT/GET and delete', async () => {

@@ -1,4 +1,4 @@
-import { bump, contentHashText, ErrorCode, join, SyncError, type ConflictRecord, type VersionVector } from '@obsidian-sync/shared';
+import { bump, contentHashText, ErrorCode, isValidContentHash, join, SyncError, type ConflictRecord, type VersionVector } from '@obsidian-sync/shared';
 import type { OpDataStore } from './store.js';
 
 export class ConflictService {
@@ -33,13 +33,39 @@ export class ConflictService {
       if (conflict.claimedBy !== input.deviceId) throw new SyncError(ErrorCode.CONFLICT_NOT_CLAIMED, 'Conflict must be claimed before resolving');
       const file = await tx.getFile(conflict.vaultId, conflict.fileId);
       if (!file) throw new SyncError(ErrorCode.NOT_FOUND, 'File not found');
+      if (input.resolvedHash !== undefined && !isValidContentHash(input.resolvedHash)) throw new SyncError(ErrorCode.BAD_REQUEST, 'Invalid resolved hash');
+      if (input.resolvedHash !== undefined && input.inlineText !== undefined) throw new SyncError(ErrorCode.BAD_REQUEST, 'Provide either resolvedHash or inlineText, not both');
       const hash = input.resolvedHash ?? (input.inlineText !== undefined ? await contentHashText(input.inlineText) : undefined);
       if (!hash) throw new SyncError(ErrorCode.BAD_REQUEST, 'Resolved content required');
-      if (input.inlineText !== undefined) await tx.putContent(hash, new TextEncoder().encode(input.inlineText));
+
+      let newBlobRef: string | null = null;
+      let newSize: number | null = file.size;
+      if (input.inlineText !== undefined) {
+        const bytes = new TextEncoder().encode(input.inlineText);
+        await tx.putContent(hash, bytes);
+        newSize = bytes.byteLength;
+      } else {
+        const blob = await tx.getBlob(hash);
+        if (blob && blob.state === 'verified') {
+          newBlobRef = hash;
+          newSize = blob.size;
+        } else {
+          const content = await tx.getContent(hash);
+          if (!content) throw new SyncError(ErrorCode.BAD_REQUEST, 'Resolved content not found');
+          newSize = content.byteLength;
+        }
+      }
+      const newEncoding = newBlobRef ? file.contentEncoding : null;
+
+      if (conflict.oursHash) await tx.removeBlobRef(conflict.oursHash, 'conflict_side', `${conflict.conflictId}:ours`);
+      if (conflict.theirsHash) await tx.removeBlobRef(conflict.theirsHash, 'conflict_side', `${conflict.conflictId}:theirs`);
+      if (file.blobRef && file.blobRef !== newBlobRef) await tx.removeBlobRef(file.blobRef, 'file_live', file.fileId);
+      if (newBlobRef) await tx.addBlobRef({ hash: newBlobRef, refType: 'file_live', refId: file.fileId });
+
       const joined = bump(join(join(conflict.oursVV ?? {}, conflict.theirsVV ?? {}), input.resolvedVV), input.deviceId);
       const resolved = { ...conflict, status: 'resolved' as const, resolvedBy: input.deviceId, resolvedHash: hash, resolvedVV: joined };
       await tx.saveConflict(resolved);
-      await tx.saveFile({ ...file, contentHash: hash, contentVV: joined, conflictId: null, deleted: false, deletedAt: null, updatedAt: new Date() });
+      await tx.saveFile({ ...file, contentHash: hash, blobRef: newBlobRef, size: newSize, contentEncoding: newEncoding, contentVV: joined, conflictId: null, deleted: false, deletedAt: null, updatedAt: new Date() });
       return resolved;
     });
   }

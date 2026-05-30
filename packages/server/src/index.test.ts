@@ -204,6 +204,44 @@ describe('conflict service', () => {
     expect(resolved.status).toBe('resolved');
     expect((await s.getFile(vaultId, fileId))!.contentVV).toMatchObject({ a: 1, b: 2, c: 1, [deviceId]: 1 });
   });
+
+  it('releases conflict_side pins and pins the chosen blob as the live ref on resolve', async () => {
+    const s = store(); const p = new OpProcessor(s);
+    const ours = 'sha256:' + 'a'.repeat(64); const theirs = 'sha256:' + 'b'.repeat(64);
+    for (const h of [ours, theirs]) await s.saveBlob({ hash: h, size: 10, state: 'verified', objectKey: h, createdAt: new Date(), verifiedAt: new Date(), unreferencedAt: null, deletedAt: null });
+    await p.process({ opId: crypto.randomUUID(), deviceId, deviceSeq: 1, fileId, vaultId, kind: 'create', type: 'attachment', newPath: 'a.png', pathClock: { lamport: 1, deviceId }, newContentVV: { [deviceId]: 1 }, contentHash: ours, blobRef: ours, size: 10 }, userId);
+    const conflict = await p.process({ opId: crypto.randomUUID(), deviceId: otherDevice, deviceSeq: 1, fileId, vaultId, kind: 'update', type: 'attachment', newContentVV: { [otherDevice]: 1 }, contentHash: theirs, blobRef: theirs, size: 10 }, userId);
+    const conflictId = conflict.type === 'ack' ? conflict.conflictId! : '';
+    expect(await s.listBlobRefs(ours)).toContainEqual({ hash: ours, refType: 'conflict_side', refId: `${conflictId}:ours` });
+    expect(await s.listBlobRefs(theirs)).toContainEqual({ hash: theirs, refType: 'conflict_side', refId: `${conflictId}:theirs` });
+    const cs = new ConflictService(s);
+    await cs.claim(conflictId, deviceId);
+    await cs.resolve({ conflictId, deviceId, resolvedHash: theirs, resolvedVV: { [deviceId]: 2 } });
+    expect(await s.listBlobRefs(theirs)).toEqual([{ hash: theirs, refType: 'file_live', refId: fileId }]);
+    expect(await s.listBlobRefs(ours)).toEqual([]);
+    const file = (await s.getFile(vaultId, fileId))!;
+    expect(file.blobRef).toBe(theirs);
+    expect(file.contentHash).toBe(theirs);
+    expect(file.size).toBe(10);
+    expect(file.conflictId).toBeNull();
+  });
+
+  it('clears the live blob ref when a blob conflict is resolved with inline text', async () => {
+    const s = store(); const p = new OpProcessor(s);
+    const ours = 'sha256:' + 'a'.repeat(64); const theirs = 'sha256:' + 'b'.repeat(64);
+    for (const h of [ours, theirs]) await s.saveBlob({ hash: h, size: 10, state: 'verified', objectKey: h, createdAt: new Date(), verifiedAt: new Date(), unreferencedAt: null, deletedAt: null });
+    await p.process({ opId: crypto.randomUUID(), deviceId, deviceSeq: 1, fileId, vaultId, kind: 'create', type: 'note', newPath: 'a.md', pathClock: { lamport: 1, deviceId }, newContentVV: { [deviceId]: 1 }, contentHash: ours, blobRef: ours, size: 10 }, userId);
+    const conflict = await p.process({ opId: crypto.randomUUID(), deviceId: otherDevice, deviceSeq: 1, fileId, vaultId, kind: 'update', type: 'note', newContentVV: { [otherDevice]: 1 }, contentHash: theirs, blobRef: theirs, size: 10 }, userId);
+    const conflictId = conflict.type === 'ack' ? conflict.conflictId! : '';
+    const cs = new ConflictService(s);
+    await cs.claim(conflictId, deviceId);
+    await cs.resolve({ conflictId, deviceId, inlineText: 'merged text', resolvedVV: { [deviceId]: 2 } });
+    expect(await s.listBlobRefs(ours)).toEqual([]);
+    expect(await s.listBlobRefs(theirs)).toEqual([]);
+    const file = (await s.getFile(vaultId, fileId))!;
+    expect(file.blobRef).toBeNull();
+    expect(file.contentHash).toBe(await contentHashText('merged text'));
+  });
 });
 
 describe('blob refcount gc', () => {
