@@ -95,7 +95,7 @@ async function applyUpdate(op: FileOp, file: StoredFile, tx: OpDataStore): Promi
     if (isConcurrent(newVV, file.contentVV)) {
       const conflict = await tx.createConflict({ vaultId: op.vaultId, fileId: op.fileId, kind: op.type === 'attachment' ? 'attachment' : 'content', baseHash: op.contentHash ?? null, oursHash: file.contentHash, theirsHash: op.contentHash ?? op.blobRef ?? null, oursVV: file.contentVV, theirsVV: newVV });
       const conflicted = { ...file, conflictId: conflict.conflictId, updatedAt: new Date() };
-      await addConflictRefs(tx, conflict.conflictId, file.contentHash, op.contentHash ?? op.blobRef ?? null);
+      await addConflictRefs(tx, conflict.conflictId, file.blobRef ?? null, op.blobRef ?? null);
       return { file: conflicted, conflictId: conflict.conflictId };
     }
     throw new SyncError(ErrorCode.STALE, 'Content version does not dominate stored version');

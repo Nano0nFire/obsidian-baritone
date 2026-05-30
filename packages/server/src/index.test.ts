@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { contentHashText, CONTENT_ENCRYPTION_ENCODING } from '@obsidian-sync/shared';
+import { contentHash, contentHashText, CONTENT_ENCRYPTION_ENCODING } from '@obsidian-sync/shared';
 import { AuthService } from './auth/service.js';
 import { TokenService, type RefreshTokenRecord, type TokenRepository } from './auth/tokens.js';
 import { BlobStore } from './blob/store.js';
@@ -53,6 +53,18 @@ describe('op processor', () => {
     const conflict = await p.process({ opId: crypto.randomUUID(), deviceId: otherDevice, deviceSeq: 1, fileId, vaultId, kind: 'update', type: 'note', newContentVV: { [deviceId]: 1, [otherDevice]: 1 }, contentHash: h3, inlineText: 'other', size: 5 }, userId);
     expect(conflict).toMatchObject({ type: 'ack' });
     expect(conflict.type === 'ack' && conflict.conflictId).toBeTruthy();
+  });
+
+  it('does not pin inline-note conflict sides as blob refs', async () => {
+    const s = store(); const p = new OpProcessor(s);
+    await createNote(p);
+    const h2 = await contentHashText('new');
+    await p.process({ opId: crypto.randomUUID(), deviceId, deviceSeq: 2, fileId, vaultId, kind: 'update', type: 'note', newContentVV: { [deviceId]: 2 }, contentHash: h2, inlineText: 'new', size: 3 }, userId);
+    const h3 = await contentHashText('other');
+    const conflict = await p.process({ opId: crypto.randomUUID(), deviceId: otherDevice, deviceSeq: 1, fileId, vaultId, kind: 'update', type: 'note', newContentVV: { [deviceId]: 1, [otherDevice]: 1 }, contentHash: h3, inlineText: 'other', size: 5 }, userId);
+    expect(conflict.type).toBe('ack');
+    expect(await s.listBlobRefs(h2)).toEqual([]);
+    expect(await s.listBlobRefs(h3)).toEqual([]);
   });
 
   it('uses Lamport LWW for rename', async () => {
@@ -203,6 +215,16 @@ describe('blob refcount gc', () => {
     expect(await bs.gcUnreferenced(10, new Date())).toEqual([]);
     await s.removeBlobRef(blob.hash, 'file_live', fileId);
     expect(await bs.gcUnreferenced(10, new Date())).toEqual([blob.hash]);
+  });
+
+  it('verifyBytes accepts bytes matching their prefixed content hash and rejects mismatches', async () => {
+    const s = store();
+    const bs = new BlobStore({ endpoint: 'http://127.0.0.1:1', bucket: 'b', accessKeyId: 'a', secretAccessKey: 's', region: 'x' }, s);
+    const bytes = new TextEncoder().encode('attachment payload');
+    const hash = await contentHash(bytes);
+    expect(hash.startsWith('sha256:')).toBe(true);
+    await expect(bs.verifyBytes(hash, bytes)).resolves.toBeUndefined();
+    await expect(bs.verifyBytes('sha256:' + '0'.repeat(64), bytes)).rejects.toThrow(/Blob hash mismatch/);
   });
 });
 

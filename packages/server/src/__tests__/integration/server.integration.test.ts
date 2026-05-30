@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { DeleteObjectCommand, GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { contentHashText, hashBytes, type FileOp, type ServerMessage } from '@obsidian-sync/shared';
+import { contentHash, contentHashText, type FileOp, type ServerMessage } from '@obsidian-sync/shared';
 import * as Y from 'yjs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { BlobStore } from '../../blob/store.js';
@@ -41,8 +41,8 @@ describe.skipIf(!integrationReady)('server integration: postgres, minio, and Lay
     await db?.close();
   });
 
-  it('runs migrations and records 001+002+003 idempotently', async () => {
-    const expected = ['001_initial', '002_yjs_layer2', '003_snapshot_history'];
+  it('runs migrations and records all versions idempotently', async () => {
+    const expected = ['001_initial', '002_yjs_layer2', '003_snapshot_history', '004_content_encoding'];
     const first = await migrate(db);
     expect(first).toEqual(expected);
 
@@ -92,7 +92,7 @@ describe.skipIf(!integrationReady)('server integration: postgres, minio, and Lay
     await migrate(db);
     const blobStore = new BlobStore(s3Config(), data);
     const bytes = new TextEncoder().encode(`minio integration ${randomUUID()}`);
-    const hash = await hashBytes(bytes);
+    const hash = await contentHash(bytes);
 
     const upload = await blobStore.initUpload(hash, bytes.byteLength);
     expect(upload.alreadyExists).toBe(false);

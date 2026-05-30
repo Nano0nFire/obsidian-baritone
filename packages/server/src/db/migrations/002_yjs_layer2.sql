@@ -5,6 +5,7 @@ ALTER TABLE yjs_rooms ADD COLUMN IF NOT EXISTS room_epoch bigint NOT NULL DEFAUL
 ALTER TABLE yjs_rooms ADD COLUMN IF NOT EXISTS activation_base_vv jsonb NOT NULL DEFAULT '{}';
 ALTER TABLE yjs_rooms ADD COLUMN IF NOT EXISTS activation_base_hash text;
 ALTER TABLE yjs_rooms ADD COLUMN IF NOT EXISTS next_seq bigint NOT NULL DEFAULT 1;
+ALTER TABLE yjs_rooms DROP CONSTRAINT IF EXISTS yjs_rooms_lease_owner_fkey;
 ALTER TABLE yjs_rooms ALTER COLUMN lease_owner TYPE text USING lease_owner::text;
 ALTER TABLE yjs_rooms DROP COLUMN IF EXISTS participants;
 

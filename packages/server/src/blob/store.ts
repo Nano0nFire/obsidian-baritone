@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { ErrorCode, hashBytes, isValidContentHash, SyncError } from '@obsidian-sync/shared';
+import { ErrorCode, contentHash, isValidContentHash, SyncError } from '@obsidian-sync/shared';
 import type { BlobRecord, OpDataStore } from '../engine/store.js';
 
 export interface BlobStoreConfig {
@@ -44,7 +44,7 @@ export class BlobStore {
   }
 
   async verifyBytes(hash: string, bytes: Uint8Array): Promise<void> {
-    if ((await hashBytes(bytes)) !== hash) throw new SyncError(ErrorCode.BLOB_HASH_MISMATCH, 'Blob hash mismatch');
+    if ((await contentHash(bytes)) !== hash) throw new SyncError(ErrorCode.BLOB_HASH_MISMATCH, 'Blob hash mismatch');
   }
 
   async getBytes(hash: string): Promise<Uint8Array | null> {
