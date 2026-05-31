@@ -1,12 +1,7 @@
 import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type ObsidianSyncPlugin from "./main.js";
 import { CONFIG_CATEGORIES, type ConfigSyncMode } from "./settings.js";
-
-function httpFromWs(url: string): string {
-  if (url.startsWith("ws://")) return `http://${url.slice(5)}`;
-  if (url.startsWith("wss://")) return `https://${url.slice(6)}`;
-  return url;
-}
+import { checkServerConnection, serverHttpBase } from "./connection.js";
 
 class EncryptionPassphraseModal extends Modal {
   private passphrase = "";
@@ -44,7 +39,7 @@ class LoginModal extends Modal {
   }
   private async login(): Promise<void> {
     try {
-      const base = httpFromWs(this.plugin.settings.serverUrl).replace(/\/sync$/, "");
+      const base = serverHttpBase(this.plugin.settings.serverUrl);
       const response = await fetch(`${base}/auth/login`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -74,6 +69,25 @@ export class ObsidianSyncSettingTab extends PluginSettingTab {
     containerEl.empty();
     containerEl.createEl("h2", { text: "Obsidian Sync" });
     new Setting(containerEl).setName("Server WebSocket URL").setDesc("Example: wss://sync.example.com/sync").addText((text) => text.setValue(this.plugin.settings.serverUrl).onChange(async (value) => { this.plugin.settings.serverUrl = value.trim(); await this.plugin.saveSettingsOnly(); }));
+    new Setting(containerEl)
+      .setName("Test connection")
+      .setDesc("Checks the server's /readyz endpoint using the URL above.")
+      .addButton((button) => button
+        .setButtonText("Test connection")
+        .onClick(async () => {
+          const original = button.buttonEl.textContent ?? "Test connection";
+          button.setButtonText("Testing…").setDisabled(true);
+          try {
+            const result = await checkServerConnection(this.plugin.settings.serverUrl);
+            if (result.ok) {
+              new Notice(`Connection OK — database: ${result.database ? "up" : "down"}, websocket: ${result.websocket ? "up" : "down"}`);
+            } else {
+              new Notice(`Connection failed: ${result.reason}`);
+            }
+          } finally {
+            button.setButtonText(original).setDisabled(false);
+          }
+        }));
     new Setting(containerEl).setName("Vault ID").addText((text) => text.setValue(this.plugin.settings.vaultId).onChange(async (value) => { this.plugin.settings.vaultId = value.trim() || "default"; await this.plugin.saveSettingsOnly(); }));
     new Setting(containerEl).setName("Device ID").setDesc(this.plugin.settings.deviceId).addButton((button) => button.setButtonText("Regenerate").onClick(async () => { this.plugin.settings.deviceId = crypto.randomUUID(); await this.plugin.saveSettingsAndRestart(); this.display(); }));
     new Setting(containerEl).setName("Login").setDesc(this.plugin.settings.username ? `Logged in as ${this.plugin.settings.username}` : "No credentials stored").addButton((button) => button.setButtonText("Login").setCta().onClick(() => new LoginModal(this.app, this.plugin).open()));
