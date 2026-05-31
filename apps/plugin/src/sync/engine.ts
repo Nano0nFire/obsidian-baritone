@@ -64,6 +64,8 @@ export class SyncEngine {
   private readonly blobUploader: BlobUploader;
   private lamport = 0;
   private state: EngineState = "idle";
+  private handshakeComplete = false;
+  private awaitingCatchup = false;
   private unsubscribe: Array<() => void> = [];
   private readonly forceWaiters = new Map<string, (result: ForcePushOpResult) => void>();
 
@@ -173,7 +175,7 @@ export class SyncEngine {
     const op = this.outbox.enqueue(draft);
     await this.persistOutbox();
     const result = await new Promise<ForcePushOpResult>((resolve) => {
-      if (this.transport.readyState !== "open") {
+      if (!this.isWriteReady()) {
         resolve({ ok: false, consumed: false, message: "transport not connected" });
         return;
       }
@@ -201,6 +203,10 @@ export class SyncEngine {
     // is not reused; normal sync recovery handles it on reconnect.
     await this.persistOutbox();
     return result;
+  }
+
+  isWriteReady(): boolean {
+    return this.transport.readyState === "ready" && this.handshakeComplete;
   }
 
   private applyForcedToIndex(op: FileOp): void {
@@ -273,6 +279,8 @@ export class SyncEngine {
   private handleTransportState(state: TransportState): void {
     if (this.settings.paused) return;
     if (state === "open") {
+      this.handshakeComplete = false;
+      this.awaitingCatchup = false;
       this.setState("syncing");
       this.transport.send({
         t: "hello",
@@ -284,9 +292,17 @@ export class SyncEngine {
         clientBuild: "0.1.0",
         capabilities: ["layer1", "manual-conflicts", "promote-demote"],
       });
-      this.flushOutbox();
-      this.yjs?.handleTransportOpen();
-    } else if (state === "connecting") this.setState("connecting");
+    } else if (state === "connecting") {
+      this.handshakeComplete = false;
+      this.awaitingCatchup = false;
+      this.setState("connecting");
+    } else if (state === "closed") {
+      this.handshakeComplete = false;
+      this.awaitingCatchup = false;
+    } else if (state === "ready") {
+      // welcome-driven readiness; actual catch-up completion is handled by
+      // message flow below so we do not flush the outbox merely on this signal.
+    }
   }
 
   private async handleMessage(message: ServerMessage): Promise<void> {
@@ -294,13 +310,18 @@ export class SyncEngine {
       if (await this.yjs?.handleMessage(message)) return;
       switch (message.t) {
         case "welcome":
-          if (message.currentSeq > this.index.device.appliedSeq) this.transport.send({ t: "get_ops", sinceSeq: this.index.device.appliedSeq });
-          this.flushOutbox();
-          break;
-        case "ops":
-          await this.applyOps(message.ops);
-          if (message.more) this.transport.send({ t: "get_ops", sinceSeq: this.index.device.appliedSeq });
-          break;
+        if (message.currentSeq > this.index.device.appliedSeq) {
+          this.awaitingCatchup = true;
+          this.transport.send({ t: "get_ops", sinceSeq: this.index.device.appliedSeq });
+        } else {
+          this.finishHandshake();
+        }
+        break;
+      case "ops":
+        if (!(await this.applyOps(message.ops))) break;
+        if (message.more) this.transport.send({ t: "get_ops", sinceSeq: this.index.device.appliedSeq });
+        else if (this.awaitingCatchup) this.finishHandshake();
+        break;
         case "op_ack":
           await this.handleAck(message);
           break;
@@ -344,6 +365,7 @@ export class SyncEngine {
       this.forceWaiters.delete(message.opId);
       waiter(message.conflictId ? { ok: false, consumed: true, message: `conflict ${message.conflictId}` } : { ok: true });
     }
+    this.flushOutbox();
   }
 
   private async handleReject(message: RejectMessage): Promise<void> {
@@ -363,32 +385,40 @@ export class SyncEngine {
       if (entry) this.promote(entry.op.fileId);
       this.outbox.reject(message.opId, message.message, false);
     } else {
-      this.outbox.reject(message.opId, message.message, true);
+      this.outbox.removeAndReindex(message.opId);
     }
     await this.persistOutbox();
+    this.flushOutbox();
   }
 
   private flushOutbox(): void {
-    if (this.transport.readyState !== "open" || this.settings.paused) return;
-    for (const entry of this.outbox.retryable()) {
-      this.outbox.markInflight(entry.op.opId);
-      this.transport.send({ t: "file_op", op: entry.op });
+    if (this.transport.readyState !== "ready" || this.settings.paused || !this.handshakeComplete) return;
+    const entries = this.outbox.retryable();
+    if (entries.some((entry) => entry.status === "inflight")) {
+      const entry = entries.find((item) => item.status === "inflight");
+      if (entry) this.transport.send({ t: "file_op", op: entry.op });
+      return;
     }
+    const next = entries.find((entry) => entry.status === "queued");
+    if (!next) return;
+    this.outbox.markInflight(next.op.opId);
+    this.transport.send({ t: "file_op", op: next.op });
     void this.persistOutbox();
   }
 
-  private async applyOps(ops: readonly AppliedOp[]): Promise<void> {
+  private async applyOps(ops: readonly AppliedOp[]): Promise<boolean> {
     const sorted = [...ops].sort((a, b) => a.vaultSeq - b.vaultSeq);
     for (const item of sorted) {
       if (item.vaultSeq <= this.index.device.appliedSeq) continue;
       if (item.vaultSeq !== this.index.device.appliedSeq + 1) {
         this.transport.send({ t: "get_ops", sinceSeq: this.index.device.appliedSeq });
-        return;
+        return false;
       }
       await this.applyOp(item.op, item.resultingClocks.contentVV, item.resultingClocks.pathClock);
       this.index.setAppliedSeq(item.vaultSeq);
     }
     await this.index.save();
+    return true;
   }
 
   private async applyOp(op: FileOp, contentVV?: VersionVector, pathClock?: PathClock): Promise<void> {
@@ -486,6 +516,13 @@ export class SyncEngine {
   private async persistOutbox(): Promise<void> {
     this.index.setOutbox(this.outbox.entries, this.outbox.nextDeviceSeq);
     await this.index.save();
+  }
+
+  private finishHandshake(): void {
+    this.awaitingCatchup = false;
+    this.handshakeComplete = true;
+    this.flushOutbox();
+    this.yjs?.handleTransportOpen();
   }
 
   private setState(state: EngineState, detail?: string): void {

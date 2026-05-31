@@ -43,7 +43,7 @@ describe.skipIf(!integrationReady)('server integration: postgres, minio, and Lay
   });
 
   it('runs migrations and records all versions idempotently', async () => {
-    const expected = ['001_initial', '002_yjs_layer2', '003_snapshot_history', '004_content_encoding'];
+    const expected = ['001_initial', '002_yjs_layer2', '003_snapshot_history', '004_content_encoding', '005_conflict_uniqueness'];
     const first = await migrate(db);
     expect(first).toEqual(expected);
 
@@ -111,8 +111,8 @@ describe.skipIf(!integrationReady)('server integration: postgres, minio, and Lay
     expect(await data.listBlobRefs(theirs)).toContainEqual({ hash: theirs, refType: 'conflict_side', refId: `${conflictId}:theirs` });
 
     const conflicts = new ConflictService(data);
-    await conflicts.claim(conflictId, deviceId);
-    const resolved = await conflicts.resolve({ conflictId, deviceId, resolvedHash: theirs, resolvedVV: { [deviceId]: 2 } });
+    await conflicts.claim(vaultId, userId, deviceId, conflictId);
+    const resolved = await conflicts.resolve({ vaultId, userId, conflictId, deviceId, resolvedHash: theirs, resolvedVV: { [deviceId]: 2 } });
     expect(resolved.status).toBe('resolved');
 
     expect(await data.listBlobRefs(ours)).toEqual([]);

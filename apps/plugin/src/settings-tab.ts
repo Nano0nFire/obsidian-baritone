@@ -1,7 +1,8 @@
 import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type ObsidianSyncPlugin from "./main.js";
 import { CONFIG_CATEGORIES, type ConfigSyncMode } from "./settings.js";
-import { checkServerConnection, serverHttpBase } from "./connection.js";
+import { checkServerConnection } from "./connection.js";
+import { loginWithPassword } from "./auth-client.js";
 import { requestUrlFetch } from "./http.js";
 
 class EncryptionPassphraseModal extends Modal {
@@ -41,15 +42,12 @@ class LoginModal extends Modal {
   private async login(): Promise<void> {
     try {
       this.plugin.appendLog({ level: "info", source: "auth", message: `Login requested for ${this.username || "(empty username)"}` });
-      const base = serverHttpBase(this.plugin.settings.serverUrl);
-      const response = await requestUrlFetch(`${base}/auth/login`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ username: this.username, password: this.password, deviceId: this.plugin.settings.deviceId, vaultId: this.plugin.settings.vaultId }),
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json() as { accessToken?: string; refreshToken?: string; deviceId?: string };
-      if (!data.accessToken || !data.refreshToken) throw new Error("Login response missing tokens");
+      const data = await loginWithPassword(this.plugin.settings.serverUrl, {
+        username: this.username,
+        password: this.password,
+        vaultId: this.plugin.settings.vaultId,
+        deviceName: this.plugin.settings.deviceId,
+      }, requestUrlFetch);
       this.plugin.settings.username = this.username;
       this.plugin.settings.accessToken = data.accessToken;
       this.plugin.settings.refreshToken = data.refreshToken;

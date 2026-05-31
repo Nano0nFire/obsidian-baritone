@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { jwtVerify, SignJWT } from 'jose';
+import { errors as joseErrors, jwtVerify, SignJWT } from 'jose';
 import { ErrorCode, SyncError } from '@obsidian-sync/shared';
 
 export interface AccessClaims {
@@ -22,6 +22,7 @@ export interface RefreshTokenRecord {
 export interface TokenRepository {
   saveRefreshToken(record: RefreshTokenRecord): Promise<void>;
   getRefreshTokenByHash(hash: string): Promise<RefreshTokenRecord | null>;
+  replaceRefreshToken(hash: string, next: RefreshTokenRecord): Promise<RefreshTokenRecord | null>;
   revokeRefreshToken(tokenId: string, replacedBy?: string): Promise<void>;
 }
 
@@ -48,26 +49,34 @@ export class TokenService {
       if (!claims.userId || !claims.deviceId || !claims.vaultId || !claims.role) throw new Error('missing claims');
       return { userId: claims.userId, deviceId: claims.deviceId, vaultId: claims.vaultId, role: claims.role };
     } catch (error) {
+      if (error instanceof joseErrors.JWTExpired) throw new SyncError(ErrorCode.TOKEN_EXPIRED, error.message);
       throw new SyncError(ErrorCode.UNAUTHENTICATED, error instanceof Error ? error.message : 'Invalid token');
     }
   }
 
   async issueRefresh(userId: string, deviceId: string, days = 30): Promise<{ token: string; record: RefreshTokenRecord }> {
     if (!this.repo) throw new Error('Token repository required for refresh tokens');
-    const token = `r.${randomUUID()}.${randomUUID()}`;
-    const record: RefreshTokenRecord = { tokenId: randomUUID(), userId, deviceId, refreshHash: hashToken(token), expiresAt: new Date(Date.now() + days * 86_400_000), revoked: false };
+    const { token, record } = this.createRefreshToken(userId, deviceId, days);
     await this.repo.saveRefreshToken(record);
     return { token, record };
   }
 
   async rotateRefresh(token: string, issue: (old: RefreshTokenRecord) => Promise<AccessClaims>): Promise<{ accessToken: string; refreshToken: string }> {
     if (!this.repo) throw new Error('Token repository required for refresh tokens');
-    const record = await this.repo.getRefreshTokenByHash(hashToken(token));
+    const tokenHash = hashToken(token);
+    const record = await this.repo.getRefreshTokenByHash(tokenHash);
     if (!record || record.revoked || record.expiresAt <= new Date()) throw new SyncError(ErrorCode.UNAUTHENTICATED, 'Invalid refresh token');
     const claims = await issue(record);
-    const next = await this.issueRefresh(record.userId, record.deviceId);
-    await this.repo.revokeRefreshToken(record.tokenId, next.record.tokenId);
+    const next = this.createRefreshToken(record.userId, record.deviceId);
+    const replaced = await this.repo.replaceRefreshToken(tokenHash, next.record);
+    if (!replaced) throw new SyncError(ErrorCode.UNAUTHENTICATED, 'Invalid refresh token');
     return { accessToken: await this.issueAccess(claims), refreshToken: next.token };
+  }
+
+  private createRefreshToken(userId: string, deviceId: string, days = 30): { token: string; record: RefreshTokenRecord } {
+    const token = `r.${randomUUID()}.${randomUUID()}`;
+    const record: RefreshTokenRecord = { tokenId: randomUUID(), userId, deviceId, refreshHash: hashToken(token), expiresAt: new Date(Date.now() + days * 86_400_000), revoked: false };
+    return { token, record };
   }
 }
 

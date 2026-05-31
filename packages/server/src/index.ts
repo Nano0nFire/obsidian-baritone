@@ -109,10 +109,11 @@ export async function startServer(): Promise<{ close(): Promise<void> }> {
   yjsGc.start();
 
   const server = http.createServer(createHttpHandler({ db, ws: { isReady: () => !closing && (wsRef.current?.isReady() ?? false) }, authRouter }));
-  const ws = new SyncWebSocketServer(server, data, tokens, opProcessor, conflicts, manifest, trash, blobStore, rooms, {
+  const ws = new SyncWebSocketServer(server, data, tokens, authRepo, opProcessor, conflicts, manifest, trash, blobStore, rooms, {
     connectionLimiter: new FixedWindowRateLimiter({ max: config.WS_CONNECTION_RATE_LIMIT_MAX, windowMs: config.WS_CONNECTION_RATE_LIMIT_WINDOW_MS }),
     messageLimiterFactory: () => new FixedWindowRateLimiter({ max: config.WS_MESSAGE_RATE_LIMIT_MAX, windowMs: config.WS_MESSAGE_RATE_LIMIT_WINDOW_MS }),
     logger: logger.child({ component: 'ws' }),
+    trustProxy: config.TRUST_PROXY,
   });
   wsRef.current = ws;
   await new Promise<void>((resolve) => server.listen(config.SERVER_PORT, resolve));

@@ -16,10 +16,12 @@ import { ForceSyncRunner } from "./sync/force-runner.js";
 import { VaultWatcher, classifyFileType } from "./watcher/vault-watcher.js";
 import { canonicalVaultPath } from "./pathing.js";
 import type { LocalFileSnapshot } from "./sync/force-sync.js";
+import { refreshSessionTokens } from "./auth-client.js";
 import { ConflictStore } from "./conflict/conflict-store.js";
 import { ConflictPanel, VIEW_TYPE_CONFLICTS } from "./conflict/conflict-panel.js";
 import { ManualChoiceModal, TextMergeModal, conflictResolvedVV } from "./conflict/merge-view.js";
 import { localConfigIgnorePatterns } from "./configsync/configsync.js";
+import { requestUrlFetch } from "./http.js";
 import type { VaultIO, VaultFileInfo } from "./sync/vault-io.js";
 import { SyncLogPanel, VIEW_TYPE_LOGS } from "./logs/log-panel.js";
 import { SyncLogStore, type SyncLogEntryInput, type SyncLogLevel } from "./logs/log-store.js";
@@ -29,6 +31,7 @@ import {
   contentHash,
   createEncryptionVerifier,
   decryptVaultBytes,
+  ErrorCode,
   deriveVaultContentKey,
   isEncryptedBlobEnvelope,
   randomEncryptionSalt,
@@ -169,45 +172,17 @@ export default class ObsidianSyncPlugin extends Plugin {
   private vaultIO!: VaultIO;
   private ignore!: SyncIgnore;
   private forceSyncInProgress = false;
+  private refreshInFlight: Promise<boolean> | null = null;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
     await this.ensurePluginDir();
     this.appendLog({ level: "info", source: "plugin", message: "Plugin loading" });
     const adapterStore = new ObsidianAdapterStore(this.app.vault.adapter);
-    this.index = new LocalIndexStore(adapterStore, STATE_PATH, this.settings.deviceId);
+    this.index = new LocalIndexStore(adapterStore, STATE_PATH, this.settings.deviceId, this.settings.vaultId);
     await this.index.load();
-    this.transport = this.createTransport(this.settings.serverUrl);
-    this.yjsManager = new YjsSessionManager(this.transport, {
-      canPromote: () => !this.settings.contentEncryption.enabled,
-      promoteDisabledReason: "Realtime collaboration is disabled while vault content encryption is enabled",
-      onSessionChanged: (fileId, session) => {
-        if (this.activeFileId === fileId) this.setYjsEditorSession(session);
-      },
-    });
     const vaultIO = new ObsidianVaultIO(this);
     this.vaultIO = vaultIO;
-    this.engine = new SyncEngine(this.settings, this.index, vaultIO, this.transport, {
-      onState: (state, detail) => {
-        this.setStatus(detail ? `${state}: ${detail}` : state);
-        this.appendLog({ level: state === "error" ? "error" : "info", source: "engine", message: detail ? `${state}: ${detail}` : state });
-      },
-      onConflict: (conflict) => {
-        this.conflictStore.upsert(conflict);
-        this.appendLog({ level: "warn", source: "conflict", message: `${conflict.kind} conflict ${conflict.conflictId} requires manual resolution` });
-        new Notice("Sync conflict requires manual resolution");
-      },
-      onError: (error) => {
-        this.appendLog({ level: "error", source: "engine", message: error.message });
-        new Notice(`Sync error: ${error.message}`);
-      },
-      onReject: (opId, code, message) => {
-        this.appendLog({ level: "warn", source: "engine", message: `Server rejected ${opId}: ${code} — ${message}` });
-      },
-    }, this.yjsManager, () => this.contentEncryptionKey);
-    const ignore = new SyncIgnore({ common: parseIgnoreLines(this.settings.commonIgnore), local: [...parseIgnoreLines(this.settings.localIgnore), ...localConfigIgnorePatterns(this.settings)] });
-    this.ignore = ignore;
-    this.watcher = new VaultWatcher(vaultIO, this.index, this.engine, ignore);
     this.statusEl = this.addStatusBarItem();
     this.presenceEl = this.addStatusBarItem();
     this.presenceEl.classList.add("obsidian-sync-presence");
@@ -219,23 +194,8 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.registerEditorExtension(this.yjsEditorExtensions);
     this.registerCommands();
     this.registerVaultEvents();
-    if (this.settings.contentEncryption.enabled && !this.contentEncryptionKey) new Notice("Vault content encryption is enabled. Enter the passphrase in sync settings before syncing content.");
-    this.engine.start();
-    this.appendLog({ level: "info", source: "plugin", message: "Sync engine started" });
-    if (this.settings.syncOnStartup && !this.settings.paused) {
-      if (this.index.device.appliedSeq === 0 && this.index.files.length === 0) {
-        this.appendLog({ level: "info", source: "initial-sync", message: "Initial sync started" });
-        void new InitialSyncRunner(this.transport, this.index, vaultIO, this.settings.vaultId, () => this.contentEncryptionKey).run()
-          .then(() => this.appendLog({ level: "info", source: "initial-sync", message: "Initial sync completed" }))
-          .catch((error: unknown) => {
-            const message = error instanceof Error ? error.message : String(error);
-            this.appendLog({ level: "error", source: "initial-sync", message: `Initial sync failed: ${message}` });
-            new Notice(`Initial sync failed: ${message}`);
-          });
-      } else {
-        await this.watcher.reconcile();
-      }
-    }
+    await this.startSyncServices();
+    await this.runStartupSync();
   }
 
   override async onunload(): Promise<void> {
@@ -262,7 +222,7 @@ export default class ObsidianSyncPlugin extends Plugin {
   private guardForce(): boolean {
     if (this.forceSyncInProgress) { new Notice("A force sync is already running."); return false; }
     if (this.settings.paused) { new Notice("Resume sync before running a force operation."); return false; }
-    if (this.transport.readyState !== "open") { new Notice("Not connected to the server. Wait for the connection to open, then retry."); return false; }
+    if (!this.engine?.isWriteReady()) { new Notice("Wait for sync catch-up to finish, then retry."); return false; }
     if (!this.encryptionUnlocked()) { new Notice("Unlock vault encryption before running a force operation."); return false; }
     return true;
   }
@@ -339,10 +299,7 @@ export default class ObsidianSyncPlugin extends Plugin {
   async saveSettingsOnly(): Promise<void> { await this.saveData(this.settings); }
   async saveSettingsAndRestart(): Promise<void> {
     await this.saveSettingsOnly();
-    if (this.engine) await this.engine.stop();
-    this.transport = this.createTransport(this.settings.serverUrl);
-    this.appendLog({ level: "info", source: "plugin", message: "Settings saved; restart required" });
-    this.setStatus("restart required");
+    await this.restartSyncServices("Settings saved; sync restarted");
   }
 
   appendLog(entry: SyncLogEntryInput): void {
@@ -503,6 +460,127 @@ export default class ObsidianSyncPlugin extends Plugin {
         this.appendLog({ level: "error", source: "transport", message: `Dropped invalid server message: ${error.message}` });
       },
     });
+  }
+
+  private async startSyncServices(): Promise<void> {
+    await this.ensureIndexMatchesDevice();
+    this.transport = this.createTransport(this.settings.serverUrl);
+    this.yjsManager = new YjsSessionManager(this.transport, {
+      canPromote: () => !this.settings.contentEncryption.enabled,
+      promoteDisabledReason: "Realtime collaboration is disabled while vault content encryption is enabled",
+      onSessionChanged: (fileId, session) => {
+        if (this.activeFileId === fileId) this.setYjsEditorSession(session);
+      },
+    });
+    this.engine = new SyncEngine(this.settings, this.index, this.vaultIO, this.transport, {
+      onState: (state, detail) => {
+        this.setStatus(detail ? `${state}: ${detail}` : state);
+        this.appendLog({ level: state === "error" ? "error" : "info", source: "engine", message: detail ? `${state}: ${detail}` : state });
+      },
+      onConflict: (conflict) => {
+        this.conflictStore.upsert(conflict);
+        this.appendLog({ level: "warn", source: "conflict", message: `${conflict.kind} conflict ${conflict.conflictId} requires manual resolution` });
+        new Notice("Sync conflict requires manual resolution");
+      },
+      onError: (error) => {
+        if (this.shouldRefreshSession(undefined, error.message)) {
+          void this.refreshSession("engine error", error.message);
+          return;
+        }
+        this.appendLog({ level: "error", source: "engine", message: error.message });
+        new Notice(`Sync error: ${error.message}`);
+      },
+      onReject: (opId, code, message) => {
+        this.appendLog({ level: "warn", source: "engine", message: `Server rejected ${opId}: ${code} — ${message}` });
+        if (this.shouldRefreshSession(code, message)) void this.refreshSession("server reject", `${code}: ${message}`);
+      },
+    }, this.yjsManager, () => this.contentEncryptionKey);
+    this.ignore = new SyncIgnore({ common: parseIgnoreLines(this.settings.commonIgnore), local: [...parseIgnoreLines(this.settings.localIgnore), ...localConfigIgnorePatterns(this.settings)] });
+    this.watcher = new VaultWatcher(this.vaultIO, this.index, this.engine, this.ignore);
+    if (this.settings.contentEncryption.enabled && !this.contentEncryptionKey) new Notice("Vault content encryption is enabled. Enter the passphrase in sync settings before syncing content.");
+    this.engine.start();
+    this.appendLog({ level: "info", source: "plugin", message: "Sync engine started" });
+  }
+
+  private async ensureIndexMatchesDevice(): Promise<void> {
+    if (this.index.device.deviceId === this.settings.deviceId && this.index.device.vaultId === this.settings.vaultId) return;
+    this.index.resetSessionState(this.settings.deviceId, this.settings.vaultId);
+    await this.index.save();
+  }
+
+  private async stopSyncServices(): Promise<void> {
+    const activeFileId = this.activeFileId;
+    this.activeFileId = null;
+    this.setYjsEditorSession(null);
+    if (activeFileId) await this.yjsManager.leaveFile(activeFileId);
+    if (this.engine) await this.engine.stop();
+  }
+
+  private async restartSyncServices(reason: string): Promise<void> {
+    const activeFile = this.app.workspace.getActiveFile();
+    await this.stopSyncServices();
+    await this.startSyncServices();
+    this.appendLog({ level: "info", source: "plugin", message: reason });
+    await this.runStartupSync();
+    await this.activateRealtimeFile(activeFile instanceof TFile ? activeFile : null);
+  }
+
+  private async runStartupSync(): Promise<void> {
+    if (!this.settings.syncOnStartup || this.settings.paused) return;
+    if (this.index.device.appliedSeq === 0 && this.index.files.length === 0) {
+      this.appendLog({ level: "info", source: "initial-sync", message: "Initial sync started" });
+      try {
+        await new InitialSyncRunner(this.transport, this.index, this.vaultIO, this.settings.vaultId, () => this.contentEncryptionKey).run();
+        this.appendLog({ level: "info", source: "initial-sync", message: "Initial sync completed" });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.appendLog({ level: "error", source: "initial-sync", message: `Initial sync failed: ${message}` });
+        new Notice(`Initial sync failed: ${message}`);
+      }
+      return;
+    }
+    await this.watcher.reconcile();
+  }
+
+  private shouldRefreshSession(code?: string, message?: string): boolean {
+    const detail = `${code ?? ""} ${message ?? ""}`;
+    return code === ErrorCode.TOKEN_EXPIRED
+      || /\bTOKEN_EXPIRED\b/.test(detail)
+      || (code === ErrorCode.UNAUTHENTICATED && /"exp" claim timestamp check failed/.test(message ?? ""))
+      || /"exp" claim timestamp check failed/.test(detail);
+  }
+
+  private async refreshSession(source: string, detail: string): Promise<boolean> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    if (!this.settings.refreshToken) {
+      this.appendLog({ level: "error", source: "auth", message: `Session expired during ${source}, but no refresh token is stored` });
+      new Notice("Session expired. Log in again.");
+      return false;
+    }
+    const run = (async () => {
+      this.appendLog({ level: "warn", source: "auth", message: `Session expired during ${source}; refreshing token` });
+      try {
+        const tokens = await refreshSessionTokens(this.settings.serverUrl, this.settings.refreshToken, requestUrlFetch);
+        this.settings.accessToken = tokens.accessToken;
+        this.settings.refreshToken = tokens.refreshToken;
+        this.settings.deviceId = tokens.deviceId;
+        await this.saveSettingsOnly();
+        await this.restartSyncServices("Session refreshed; reconnecting");
+        this.appendLog({ level: "info", source: "auth", message: "Session refresh succeeded" });
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.appendLog({ level: "error", source: "auth", message: `Session refresh failed after ${detail}: ${message}` });
+        new Notice("Session expired. Log in again.");
+        return false;
+      }
+    })();
+    this.refreshInFlight = run;
+    try {
+      return await run;
+    } finally {
+      if (this.refreshInFlight === run) this.refreshInFlight = null;
+    }
   }
 
   private async openMerge(conflict: ConflictRecord): Promise<void> {

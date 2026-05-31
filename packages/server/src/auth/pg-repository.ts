@@ -1,4 +1,4 @@
-import type { Queryable } from '../db/pool.js';
+import type { Queryable, TxFn } from '../db/pool.js';
 import type { Role } from '../engine/store.js';
 import type { AuthRepository } from './service.js';
 import type { RefreshTokenRecord, TokenRepository } from './tokens.js';
@@ -9,8 +9,12 @@ function isUuid(value: string): boolean {
   return UUID_RE.test(value);
 }
 
+interface TransactionalQueryable extends Queryable {
+  withTx?<T>(fn: TxFn<T>): Promise<T>;
+}
+
 export class PgAuthRepository implements AuthRepository, TokenRepository {
-  constructor(private readonly db: Queryable) {}
+  constructor(private readonly db: TransactionalQueryable) {}
 
   async createUser(username: string, pwHash: string): Promise<{ userId: string; username: string }> {
     const res = await this.db.query<{ user_id: string; username: string }>('INSERT INTO users(username,pw_hash) VALUES($1,$2) RETURNING user_id,username', [username, pwHash]);
@@ -52,7 +56,35 @@ export class PgAuthRepository implements AuthRepository, TokenRepository {
     const r = res.rows[0];
     return r ? { tokenId: r.token_id, userId: r.user_id, deviceId: r.device_id, refreshHash: r.refresh_hash, expiresAt: r.expires_at, revoked: r.revoked, replacedBy: r.replaced_by ?? undefined } : null;
   }
+  async replaceRefreshToken(hash: string, next: RefreshTokenRecord): Promise<RefreshTokenRecord | null> {
+    return this.withTx(async (tx) => {
+      const res = await tx.query<{ token_id: string; user_id: string; device_id: string; refresh_hash: string; expires_at: Date; revoked: boolean; replaced_by: string | null }>(
+        'UPDATE tokens SET revoked=true,replaced_by=$2 WHERE refresh_hash=$1 AND revoked=false AND expires_at > now() RETURNING token_id,user_id,device_id,refresh_hash,expires_at,revoked,replaced_by',
+        [hash, next.tokenId],
+      );
+      const row = res.rows[0];
+      if (!row) return null;
+      await tx.query(
+        'INSERT INTO tokens(token_id,user_id,device_id,refresh_hash,expires_at,revoked,replaced_by) VALUES($1,$2,$3,$4,$5,$6,$7)',
+        [next.tokenId, next.userId, next.deviceId, next.refreshHash, next.expiresAt, next.revoked, next.replacedBy ?? null],
+      );
+      return {
+        tokenId: row.token_id,
+        userId: row.user_id,
+        deviceId: row.device_id,
+        refreshHash: row.refresh_hash,
+        expiresAt: row.expires_at,
+        revoked: row.revoked,
+        replacedBy: row.replaced_by ?? undefined,
+      };
+    });
+  }
   async revokeRefreshToken(tokenId: string, replacedBy?: string): Promise<void> {
     await this.db.query('UPDATE tokens SET revoked=true,replaced_by=$2 WHERE token_id=$1', [tokenId, replacedBy ?? null]);
+  }
+
+  private async withTx<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+    if (this.db.withTx) return this.db.withTx(fn);
+    return fn(this.db);
   }
 }

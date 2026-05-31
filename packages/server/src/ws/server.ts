@@ -11,6 +11,7 @@ import { ManifestService } from '../engine/manifest.js';
 import { TrashService } from '../engine/trash.js';
 import { RoomManager, type RoomSink } from '../engine/room-manager.js';
 import type { OpDataStore } from '../engine/store.js';
+import type { AuthRepository } from '../auth/service.js';
 import { clientMessageSchema, type ValidatedClientMessage } from './validation.js';
 
 interface ConnectionState { claims?: AccessClaims; vaultId?: string; deviceId?: string; queue?: Promise<void>; messageLimiter: FixedWindowRateLimiter }
@@ -19,11 +20,13 @@ export interface SyncWebSocketServerOptions {
   connectionLimiter?: FixedWindowRateLimiter;
   messageLimiterFactory?: () => FixedWindowRateLimiter;
   logger?: Logger;
+  trustProxy?: boolean;
 }
 
 export class SyncWebSocketServer {
   readonly wss: WebSocketServer;
   private readonly clients = new Set<{ socket: WebSocket; state: ConnectionState }>();
+  private readonly pendingBlobOwners = new Set<string>();
   private accepting = true;
   private readonly messageLimiterFactory: () => FixedWindowRateLimiter;
   private readonly logger?: Logger;
@@ -32,6 +35,7 @@ export class SyncWebSocketServer {
     server: http.Server,
     private readonly store: OpDataStore,
     private readonly tokens: TokenService,
+    private readonly auth: Pick<AuthRepository, 'getDevice' | 'getMember'>,
     private readonly opProcessor: OpProcessor,
     private readonly conflicts: ConflictService,
     private readonly manifest: ManifestService,
@@ -44,7 +48,7 @@ export class SyncWebSocketServer {
     this.messageLimiterFactory = options.messageLimiterFactory ?? (() => new FixedWindowRateLimiter({ max: 120, windowMs: 10_000 }));
     this.logger = options.logger;
     server.on('upgrade', (request, socket, head) => {
-      const ip = clientIp(request);
+      const ip = clientIp(request, options.trustProxy ?? false);
       const allowed = this.accepting && (!options.connectionLimiter || options.connectionLimiter.consume(ip).allowed);
       if (!allowed) {
         socket.write('HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\nContent-Type: application/json\r\n\r\n{"error":"RATE_LIMITED"}');
@@ -97,9 +101,11 @@ export class SyncWebSocketServer {
       case 'hello': await this.hello(socket, state, msg); break;
       case 'file_op': {
         if (msg.op.deviceId !== state.deviceId || msg.op.vaultId !== state.vaultId) throw new SyncError(ErrorCode.UNAUTHENTICATED, 'Operation device/vault must match the authenticated connection');
+        await this.assertOpContentAccess(state, msg.op);
         const result = await this.opProcessor.process(msg.op, state.claims!.userId);
         send(socket, result.type === 'ack' ? { t: 'op_ack', opId: result.opId, vaultSeq: result.vaultSeq, resultingClocks: result.resultingClocks, conflictId: result.conflictId } : { t: 'reject', opId: result.opId, code: result.code, message: result.message, details: result.details });
         if (result.type === 'ack') {
+          if (msg.op.blobRef) this.pendingBlobOwners.delete(blobOwnerKey(state.vaultId!, msg.op.blobRef));
           this.broadcastOps(state.vaultId!, socket, [{ vaultSeq: result.vaultSeq, op: msg.op, resultingClocks: result.resultingClocks }]);
           if (msg.op.kind === 'delete') await this.rooms.closeDeleted(state.vaultId!, msg.op.fileId);
         }
@@ -110,18 +116,28 @@ export class SyncWebSocketServer {
         send(socket, { t: 'ops', ops, more: ops.length === 1000 });
         break;
       }
-      case 'blob_upload_init': send(socket, { t: 'blob_upload_url', ...(await this.blobs.initUpload(msg.hash, msg.size)) }); break;
-      case 'blob_upload_complete': await this.blobs.completeUpload(msg.hash); send(socket, { t: 'blob_upload_url', hash: msg.hash, url: null, alreadyExists: true }); break;
-      case 'claim_conflict': send(socket, { t: 'conflict_state', conflictId: msg.conflictId, status: (await this.conflicts.claim(msg.conflictId, state.deviceId!)).status, claimedBy: state.deviceId }); break;
-      case 'release_conflict': send(socket, { t: 'conflict_state', conflictId: msg.conflictId, status: (await this.conflicts.release(msg.conflictId, state.deviceId!)).status }); break;
-      case 'resolve_conflict': send(socket, { t: 'conflict', conflict: await this.conflicts.resolve({ conflictId: msg.conflictId, deviceId: state.deviceId!, resolvedHash: msg.resolvedHash, inlineText: msg.inlineText, resolvedVV: msg.resolvedVV }) }); break;
-      case 'get_manifest': send(socket, await this.manifest.page(msg.vaultId, msg.cursor)); break;
+      case 'blob_upload_init':
+        {
+          const upload = await this.blobs.initUpload(msg.hash, msg.size);
+          if (!upload.alreadyExists) this.pendingBlobOwners.add(blobOwnerKey(state.vaultId!, msg.hash));
+          send(socket, { t: 'blob_upload_url', ...upload });
+        }
+        break;
+      case 'blob_upload_complete':
+        await this.blobs.completeUpload(msg.hash);
+        send(socket, { t: 'blob_upload_url', hash: msg.hash, url: null, alreadyExists: true });
+        break;
+      case 'claim_conflict': send(socket, { t: 'conflict_state', conflictId: msg.conflictId, status: (await this.conflicts.claim(state.vaultId!, state.claims!.userId, state.deviceId!, msg.conflictId)).status, claimedBy: state.deviceId }); break;
+      case 'release_conflict': send(socket, { t: 'conflict_state', conflictId: msg.conflictId, status: (await this.conflicts.release(state.vaultId!, state.claims!.userId, state.deviceId!, msg.conflictId)).status }); break;
+      case 'resolve_conflict': send(socket, { t: 'conflict', conflict: await this.conflicts.resolve({ vaultId: state.vaultId!, userId: state.claims!.userId, conflictId: msg.conflictId, deviceId: state.deviceId!, resolvedHash: msg.resolvedHash, inlineText: msg.inlineText, resolvedVV: msg.resolvedVV, allowPendingResolvedHash: msg.resolvedHash ? this.pendingBlobOwners.has(blobOwnerKey(state.vaultId!, msg.resolvedHash)) : false }) }); break;
+      case 'get_manifest': send(socket, await this.manifest.page(state.vaultId!, msg.cursor)); break;
       case 'get_content': {
+        if (!(await this.store.hasContentForVault(state.vaultId!, msg.hash))) throw new SyncError(ErrorCode.FORBIDDEN, 'Content is not available for this vault');
         const bytes = await this.manifest.getContent(msg.hash) ?? await this.blobs.getBytes(msg.hash);
         send(socket, { t: 'content', hash: msg.hash, data: bytes ? Buffer.from(bytes).toString('base64') : null });
         break;
       }
-      case 'list_trash': send(socket, { t: 'trash_list', items: await this.trash.list(msg.vaultId) }); break;
+      case 'list_trash': send(socket, { t: 'trash_list', items: await this.trash.list(state.vaultId!) }); break;
       case 'promote': {
         send(socket, await this.rooms.promote(state.vaultId!, msg.fileId, state.deviceId!, state.claims!.userId, sinkFor(socket, state.deviceId!)));
         break;
@@ -157,14 +173,31 @@ export class SyncWebSocketServer {
   }
 
   private async hello(socket: WebSocket, state: ConnectionState, msg: Extract<ValidatedClientMessage, { t: 'hello' }>): Promise<void> {
+    if (state.claims) throw new SyncError(ErrorCode.BAD_REQUEST, 'hello already received');
     if (msg.protocolVersion < MIN_CLIENT_PROTOCOL) throw new SyncError(ErrorCode.UPGRADE_REQUIRED, 'Client protocol is too old', { minClientProtocol: MIN_CLIENT_PROTOCOL });
     const claims = await this.tokens.verifyAccess(msg.token);
     if (claims.deviceId !== msg.deviceId || claims.vaultId !== msg.vaultId) throw new SyncError(ErrorCode.UNAUTHENTICATED, 'Token/device/vault mismatch');
+    const device = await this.auth.getDevice(claims.deviceId);
+    if (!device || device.revoked || device.userId !== claims.userId || device.vaultId !== claims.vaultId) throw new SyncError(ErrorCode.DEVICE_REVOKED, 'Device is not valid');
+    const member = await this.auth.getMember(claims.vaultId, claims.userId);
+    if (!member) throw new SyncError(ErrorCode.FORBIDDEN, 'No vault access');
     state.claims = claims; state.deviceId = msg.deviceId; state.vaultId = msg.vaultId;
     send(socket, { t: 'welcome', serverTime: Date.now(), currentSeq: await this.store.currentSeq(msg.vaultId), serverProtocol: PROTOCOL_VERSION, minClientProtocol: MIN_CLIENT_PROTOCOL, capabilities: ['layer1', 'blob-presign', 'manifest-v1', 'conflict-v1', 'yjs-lease-v1', 'yjs-realtime', 'snapshot-history-v1'] });
     const ops = await this.store.listOps(msg.vaultId, msg.lastSeq, 1000);
     if (ops.length) send(socket, { t: 'ops', ops, more: ops.length === 1000 });
   }
+
+  private async assertOpContentAccess(state: ConnectionState, op: Extract<ValidatedClientMessage, { t: 'file_op' }>['op']): Promise<void> {
+    if (op.inlineText !== undefined || !op.contentHash) return;
+    const hash = op.blobRef ?? op.contentHash;
+    const ownsHash = await this.store.hasContentForVault(state.vaultId!, hash);
+    const uploadedHere = this.pendingBlobOwners.has(blobOwnerKey(state.vaultId!, hash));
+    if (!ownsHash && !uploadedHere) throw new SyncError(ErrorCode.FORBIDDEN, 'Content hash is not available for this vault');
+  }
+}
+
+function blobOwnerKey(vaultId: string, hash: string): string {
+  return `${vaultId}:${hash}`;
 }
 
 function sinkFor(socket: WebSocket, deviceId: string): RoomSink {
@@ -182,10 +215,12 @@ function errorToWire(error: unknown): ServerMessage {
   return { t: 'error', code: ErrorCode.INTERNAL, message: error instanceof Error ? error.message : 'Internal error' };
 }
 
-function clientIp(request: http.IncomingMessage): string {
-  const forwarded = request.headers['x-forwarded-for'];
-  if (typeof forwarded === 'string' && forwarded.trim()) return forwarded.split(',')[0]!.trim();
-  if (Array.isArray(forwarded) && forwarded[0]) return forwarded[0].split(',')[0]!.trim();
+export function clientIp(request: http.IncomingMessage, trustProxy = false): string {
+  if (trustProxy) {
+    const forwarded = request.headers['x-forwarded-for'];
+    if (typeof forwarded === 'string' && forwarded.trim()) return forwarded.split(',')[0]!.trim();
+    if (Array.isArray(forwarded) && forwarded[0]) return forwarded[0].split(',')[0]!.trim();
+  }
   return request.socket.remoteAddress ?? 'unknown';
 }
 

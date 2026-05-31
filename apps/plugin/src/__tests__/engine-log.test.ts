@@ -31,16 +31,27 @@ class FakeVault implements VaultIO {
 }
 
 class FakeTransport {
-  readyState: TransportState = "open";
+  readyState: TransportState = "closed";
   readonly sent: ClientMessage[] = [];
   private listener: ((message: ServerMessage) => void | Promise<void>) | null = null;
+  private stateListener: ((state: TransportState) => void) | null = null;
   onMessage(listener: (message: ServerMessage) => void | Promise<void>): () => void { this.listener = listener; return () => { this.listener = null; }; }
-  onState(): () => void { return () => {}; }
-  connect(): void {}
+  onState(listener: (state: TransportState) => void): () => void { this.stateListener = listener; return () => { this.stateListener = null; }; }
+  connect(): void {
+    this.readyState = "open";
+    this.stateListener?.("open");
+  }
   close(): void {}
   send(message: ClientMessage): void { this.sent.push(message); }
   waitFor(): Promise<never> { return Promise.reject(new Error("unused")); }
   async deliver(message: ServerMessage): Promise<void> { await this.listener?.(message); }
+  async sendServer(message: ServerMessage): Promise<void> {
+    if (message.t === "welcome") {
+      this.readyState = "ready";
+      this.stateListener?.("ready");
+    }
+    await this.deliver(message);
+  }
   async waitForOp(): Promise<FileOp> {
     for (let i = 0; i < 50; i += 1) {
       const message = [...this.sent].reverse().find((entry) => entry.t === "file_op");
@@ -51,11 +62,20 @@ class FakeTransport {
   }
 }
 
-function makeEngine(transport: FakeTransport, onReject: ReturnType<typeof vi.fn>) {
+async function makeEngine(transport: FakeTransport, onReject: ReturnType<typeof vi.fn>) {
   const settings: PluginSettings = { ...DEFAULT_SETTINGS, deviceId, vaultId: "vault-1", accessToken: "token", paused: false };
   const index = new LocalIndexStore(memAdapter(), "idx.json", deviceId);
+  await index.load();
   const engine = new SyncEngine(settings, index, new FakeVault(), transport as unknown as SyncTransport, { onReject });
   engine.start();
+  await transport.sendServer({
+    t: "welcome",
+    serverTime: Date.now(),
+    currentSeq: 0,
+    serverProtocol: 1,
+    minClientProtocol: 1,
+    capabilities: [],
+  });
   return engine;
 }
 
@@ -63,7 +83,7 @@ describe("SyncEngine reject logging hook", () => {
   it("emits onReject when the server rejects an outbox op", async () => {
     const transport = new FakeTransport();
     const onReject = vi.fn();
-    const engine = makeEngine(transport, onReject);
+    const engine = await makeEngine(transport, onReject);
 
     const draft = await engine.makeContentOp("f1", "note.md", "note", "hello");
     await engine.enqueueLocalChange(draft);

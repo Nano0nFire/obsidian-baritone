@@ -15,6 +15,7 @@ export class InitialSyncRunner {
   constructor(private readonly transport: SyncTransport, private readonly index: LocalIndexStore, private readonly vault: VaultIO, private readonly vaultId: string, private readonly contentKeyProvider: () => VaultContentKey | null = () => null) {}
 
   async run(): Promise<void> {
+    await this.transport.waitUntilReady();
     let cursor = this.index.device.manifestCursor ?? undefined;
     let watermark = this.index.device.manifestWatermarkSeq ?? 0;
     do {
@@ -37,6 +38,7 @@ export class InitialSyncRunner {
   /** Page through the full live manifest without mutating local state. Single
    * consumer of the manifest stream — callers must not page concurrently. */
   async fetchManifest(): Promise<{ entries: ManifestEntry[]; watermarkSeq: number }> {
+    await this.transport.waitUntilReady();
     const entries: ManifestEntry[] = [];
     let cursor: string | undefined;
     let watermark = 0;

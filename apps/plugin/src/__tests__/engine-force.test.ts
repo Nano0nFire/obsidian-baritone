@@ -33,7 +33,7 @@ class FakeVault implements VaultIO {
 }
 
 class FakeTransport {
-  readyState: TransportState = "open";
+  readyState: TransportState = "ready";
   readonly sent: ClientMessage[] = [];
   private listener: ((m: ServerMessage) => void | Promise<void>) | null = null;
   onMessage(l: (m: ServerMessage) => void | Promise<void>): () => void { this.listener = l; return () => { this.listener = null; }; }
@@ -55,11 +55,23 @@ function makeEngine(transport: FakeTransport, vault: FakeVault) {
   return { engine, index };
 }
 
+async function welcome(transport: FakeTransport, currentSeq = 0): Promise<void> {
+  await transport.deliver({
+    t: "welcome",
+    serverTime: Date.now(),
+    currentSeq,
+    serverProtocol: 1,
+    minClientProtocol: 1,
+    capabilities: [],
+  });
+}
+
 describe("SyncEngine force push", () => {
   it("forced content op dominates the remote contentVV and upserts index on ack", async () => {
     const transport = new FakeTransport();
     const vault = new FakeVault();
     const { engine, index } = makeEngine(transport, vault);
+    await welcome(transport);
 
     const remoteVV = { remote: 5 };
     const draft = await engine.makeForcedContentOp("f1", "note.md", "note", remoteVV, true);
@@ -81,6 +93,7 @@ describe("SyncEngine force push", () => {
     const transport = new FakeTransport();
     const vault = new FakeVault();
     const { engine, index } = makeEngine(transport, vault);
+    await welcome(transport);
 
     const draft = await engine.makeForcedContentOp("f1", "note.md", "note", {}, false);
     const promise = engine.pushForced(draft);
@@ -97,6 +110,7 @@ describe("SyncEngine force push", () => {
     const transport = new FakeTransport();
     const vault = new FakeVault();
     const { engine, index } = makeEngine(transport, vault);
+    await welcome(transport);
 
     const draft = await engine.makeForcedContentOp("f1", "note.md", "note", {}, false);
     const promise = engine.pushForced(draft);

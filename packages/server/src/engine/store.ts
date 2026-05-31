@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { AppliedOp, ConflictRecord, ContentEncryptionEncoding, FileOp, FileType, ManifestEntry, ResultingClocks } from '@obsidian-sync/shared';
+import type { AppliedOp, ConflictRecord, ConflictStatus, ContentEncryptionEncoding, FileOp, FileType, ManifestEntry, ResultingClocks } from '@obsidian-sync/shared';
 import { caseFoldPath, type PathClock, type VersionVector } from '@obsidian-sync/shared';
 
 export type Role = 'owner' | 'editor' | 'viewer';
@@ -107,8 +107,10 @@ export interface OpDataStore {
   createConflict(input: Omit<ConflictRecord, 'conflictId' | 'status'>): Promise<ConflictRecord>;
   getConflict(conflictId: string): Promise<ConflictRecord | null>;
   saveConflict(conflict: ConflictRecord): Promise<void>;
+  compareAndSetConflict(conflict: ConflictRecord, expected: { status: ConflictStatus; claimedBy?: string | null }): Promise<boolean>;
   listManifest(vaultId: string, cursor: ManifestCursor | null, limit: number): Promise<{ items: ManifestEntry[]; nextCursor: ManifestCursor | null }>;
   listTrash(vaultId: string, now: Date): Promise<StoredFile[]>;
+  hasContentForVault(vaultId: string, hash: string): Promise<boolean>;
   getContent(hash: string): Promise<Uint8Array | null>;
   putContent(hash: string, bytes: Uint8Array): Promise<void>;
 }
@@ -181,6 +183,14 @@ export class InMemoryDataStore implements OpDataStore {
   }
   async getConflict(conflictId: string): Promise<ConflictRecord | null> { return clone(this.conflicts.get(conflictId) ?? null); }
   async saveConflict(conflict: ConflictRecord): Promise<void> { this.conflicts.set(conflict.conflictId, clone(conflict)); }
+  async compareAndSetConflict(conflict: ConflictRecord, expected: { status: ConflictStatus; claimedBy?: string | null }): Promise<boolean> {
+    const current = this.conflicts.get(conflict.conflictId);
+    if (!current) return false;
+    if (current.status !== expected.status) return false;
+    if ((current.claimedBy ?? null) !== (expected.claimedBy ?? null)) return false;
+    this.conflicts.set(conflict.conflictId, clone(conflict));
+    return true;
+  }
   async listManifest(vaultId: string, cursor: ManifestCursor | null, limit: number): Promise<{ items: ManifestEntry[]; nextCursor: ManifestCursor | null }> {
     const files = [...this.files.values()].filter((f) => f.vaultId === vaultId && !f.deleted).sort((a, b) => a.pathNormalized.localeCompare(b.pathNormalized) || a.fileId.localeCompare(b.fileId));
     const filtered = cursor ? files.filter((f) => f.pathNormalized > cursor.pathNormalized || (f.pathNormalized === cursor.pathNormalized && f.fileId > cursor.fileId)) : files;
@@ -189,6 +199,11 @@ export class InMemoryDataStore implements OpDataStore {
     return { items: page.map(toManifestEntry), nextCursor: filtered.length > limit && last ? { pathNormalized: last.pathNormalized, fileId: last.fileId } : null };
   }
   async listTrash(vaultId: string): Promise<StoredFile[]> { return [...this.files.values()].filter((f) => f.vaultId === vaultId && f.deleted).map(clone); }
+  async hasContentForVault(vaultId: string, hash: string): Promise<boolean> {
+    if ([...this.files.values()].some((f) => f.vaultId === vaultId && f.contentHash === hash)) return true;
+    if ([...this.conflicts.values()].some((c) => c.vaultId === vaultId && [c.baseHash, c.oursHash, c.theirsHash].includes(hash))) return true;
+    return (this.opsByVault.get(vaultId) ?? []).some((op) => op.payload.contentHash === hash || op.payload.blobRef === hash);
+  }
   async getContent(hash: string): Promise<Uint8Array | null> { const bytes = this.content.get(hash); return bytes ? new Uint8Array(bytes) : null; }
   async putContent(hash: string, bytes: Uint8Array): Promise<void> { this.content.set(hash, new Uint8Array(bytes)); }
 }

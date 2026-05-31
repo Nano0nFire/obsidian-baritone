@@ -18,10 +18,11 @@ export interface FileIndexEntry {
 export interface DeviceState {
   appliedSeq: number;
   deviceId: string;
+  vaultId: string | null;
   nextDeviceSeq: number;
   outbox: OutboxEntry[];
   manifestCursor?: string | null;
-  manifestWatermarkSeq?: number;
+  manifestWatermarkSeq?: number | null;
   downloadedHashes: string[];
 }
 
@@ -45,11 +46,24 @@ function isDestinationExistsError(error: unknown): boolean {
   return error instanceof Error && /destination file already exist/i.test(error.message);
 }
 
-function defaultSnapshot(deviceId: string): LocalIndexSnapshot {
+function defaultDeviceState(deviceId: string, vaultId: string | null): DeviceState {
+  return {
+    appliedSeq: 0,
+    deviceId,
+    vaultId,
+    nextDeviceSeq: 1,
+    outbox: [],
+    manifestCursor: null,
+    manifestWatermarkSeq: null,
+    downloadedHashes: [],
+  };
+}
+
+function defaultSnapshot(deviceId: string, vaultId: string | null): LocalIndexSnapshot {
   return {
     schemaVersion: 1,
     files: [],
-    device: { appliedSeq: 0, deviceId, nextDeviceSeq: 1, outbox: [], downloadedHashes: [] },
+    device: defaultDeviceState(deviceId, vaultId),
     conflicts: [],
   };
 }
@@ -57,8 +71,8 @@ function defaultSnapshot(deviceId: string): LocalIndexSnapshot {
 export class LocalIndexStore {
   private snapshot: LocalIndexSnapshot;
 
-  constructor(private readonly adapter: PluginAdapter, private readonly path: string, deviceId: string) {
-    this.snapshot = defaultSnapshot(deviceId);
+  constructor(private readonly adapter: PluginAdapter, private readonly path: string, deviceId: string, vaultId: string | null = null) {
+    this.snapshot = defaultSnapshot(deviceId, vaultId);
   }
 
   get data(): LocalIndexSnapshot { return this.snapshot; }
@@ -78,6 +92,7 @@ export class LocalIndexStore {
       device: {
         appliedSeq: parsed.device.appliedSeq ?? 0,
         deviceId: parsed.device.deviceId,
+        vaultId: parsed.device.vaultId ?? null,
         nextDeviceSeq: parsed.device.nextDeviceSeq ?? 1,
         outbox: parsed.device.outbox ?? [],
         manifestCursor: parsed.device.manifestCursor,
@@ -132,6 +147,14 @@ export class LocalIndexStore {
   setOutbox(outbox: OutboxEntry[], nextDeviceSeq: number): void {
     this.snapshot.device.outbox = outbox;
     this.snapshot.device.nextDeviceSeq = nextDeviceSeq;
+  }
+  resetSessionState(deviceId: string, vaultId: string | null): void {
+    if (this.snapshot.device.deviceId === deviceId && this.snapshot.device.vaultId === vaultId) return;
+    if (this.snapshot.device.vaultId !== vaultId) {
+      this.snapshot = defaultSnapshot(deviceId, vaultId);
+      return;
+    }
+    this.snapshot.device = defaultDeviceState(deviceId, vaultId);
   }
   addConflict(conflictId: string): void {
     if (!this.snapshot.conflicts.includes(conflictId)) this.snapshot.conflicts.push(conflictId);

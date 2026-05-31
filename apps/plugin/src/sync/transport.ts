@@ -1,6 +1,6 @@
 import type { ClientMessage, ServerMessage } from "@obsidian-sync/shared";
 
-export type TransportState = "closed" | "connecting" | "open";
+export type TransportState = "closed" | "connecting" | "open" | "ready";
 type Listener = (message: ServerMessage) => void | Promise<void>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -144,6 +144,7 @@ export class SyncTransport {
     socket.onmessage = (event) => {
       try {
         const msg = parseServerMessage(String(event.data));
+        if (msg.t === "welcome") this.setState("ready");
         for (const listener of this.listeners) void listener(msg);
       } catch (error) {
         const normalized = error instanceof Error ? error : new Error(String(error));
@@ -175,6 +176,27 @@ export class SyncTransport {
     }
     this.pendingMessages.push(message);
     this.connect();
+  }
+
+  waitUntilReady(timeoutMs = 30_000): Promise<void> {
+    if (this.state === "ready") return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        off();
+        reject(new Error("Timed out waiting for transport readiness"));
+      }, timeoutMs);
+      const off = this.onState((state) => {
+        if (state === "ready") {
+          clearTimeout(timer);
+          off();
+          resolve();
+        } else if (state === "closed") {
+          clearTimeout(timer);
+          off();
+          reject(new Error("Transport closed before authentication completed"));
+        }
+      });
+    });
   }
 
   waitFor<T extends ServerMessage["t"]>(type: T, predicate: (message: Extract<ServerMessage, { t: T }>) => boolean, timeoutMs = 30_000): Promise<Extract<ServerMessage, { t: T }>> {

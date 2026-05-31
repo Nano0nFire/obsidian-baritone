@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { PgAuthRepository } from './pg-repository.js';
 import type { Queryable } from '../db/pool.js';
+import type { RefreshTokenRecord } from './tokens.js';
 
 function throwingDb(): Queryable {
   return {
@@ -28,5 +29,60 @@ describe('PgAuthRepository identifier validation', () => {
     const repo = new PgAuthRepository(throwingDb());
     const device = await repo.getDevice('not-a-uuid');
     expect(device).toBeNull();
+  });
+});
+
+describe('PgAuthRepository.replaceRefreshToken', () => {
+  it('consumes the old token and inserts the replacement inside one transaction', async () => {
+    const calls: string[] = [];
+    const oldRecord = {
+      token_id: 'old-token',
+      user_id: 'user-1',
+      device_id: 'device-1',
+      refresh_hash: 'old-hash',
+      expires_at: new Date('2030-01-01T00:00:00Z'),
+      revoked: false,
+      replaced_by: null,
+    };
+    const tx: Queryable = {
+      async query(text: string) {
+        calls.push(text);
+        if (text.startsWith('UPDATE tokens SET revoked=true')) return { rows: [oldRecord], rowCount: 1 };
+        if (text.startsWith('INSERT INTO tokens(')) return { rows: [], rowCount: 1 };
+        throw new Error(`unexpected query: ${text}`);
+      },
+    };
+    const db = {
+      async query() {
+        throw new Error('top-level query should not be used');
+      },
+      async withTx<T>(fn: (client: Queryable) => Promise<T>): Promise<T> {
+        return fn(tx);
+      },
+    };
+    const repo = new PgAuthRepository(db);
+    const next: RefreshTokenRecord = {
+      tokenId: 'next-token',
+      userId: 'user-1',
+      deviceId: 'device-1',
+      refreshHash: 'next-hash',
+      expiresAt: new Date('2030-02-01T00:00:00Z'),
+      revoked: false,
+    };
+
+    const replaced = await repo.replaceRefreshToken('old-hash', next);
+
+    expect(replaced).toEqual({
+      tokenId: 'old-token',
+      userId: 'user-1',
+      deviceId: 'device-1',
+      refreshHash: 'old-hash',
+      expiresAt: new Date('2030-01-01T00:00:00Z'),
+      revoked: false,
+      replacedBy: undefined,
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toContain('UPDATE tokens SET revoked=true,replaced_by=$2');
+    expect(calls[1]).toContain('INSERT INTO tokens(token_id,user_id,device_id,refresh_hash,expires_at,revoked,replaced_by)');
   });
 });

@@ -59,4 +59,16 @@ describe("OutboxManager", () => {
     expect(outbox.entries).toHaveLength(2);
     expect(outbox.nextDeviceSeq).toBe(3);
   });
+
+  it("removes an unconsumed op and reindexes later queued entries to avoid seq gaps", () => {
+    const outbox = new OutboxManager("device-a", 1, []);
+    const first = outbox.enqueue(createFileOpDraft({ vaultId: "v", fileId: "f1", type: "note", kind: "delete" }));
+    const second = outbox.enqueue(createFileOpDraft({ vaultId: "v", fileId: "f2", type: "note", kind: "delete" }));
+    const third = outbox.enqueue(createFileOpDraft({ vaultId: "v", fileId: "f3", type: "note", kind: "delete" }));
+
+    expect(outbox.removeAndReindex(first.opId)).toBe(true);
+    expect(outbox.entries.map((entry) => entry.op.deviceSeq)).toEqual([1, 2]);
+    expect(outbox.entries.map((entry) => entry.op.opId)).toEqual([second.opId, third.opId]);
+    expect(outbox.nextDeviceSeq).toBe(3);
+  });
 });

@@ -90,6 +90,18 @@ export class OutboxManager {
     return true;
   }
 
+  removeAndReindex(opId: string): boolean {
+    const entry = this.map.get(opId);
+    if (!entry) return false;
+    const removedSeq = entry.op.deviceSeq;
+    this.map.delete(opId);
+    for (const item of this.map.values()) {
+      if (item.op.deviceSeq > removedSeq) item.op.deviceSeq -= 1;
+    }
+    this._nextDeviceSeq -= 1;
+    return true;
+  }
+
   /**
    * Discard never-sent ("queued") ops and rewind nextDeviceSeq so the device's
    * sequence stays contiguous. Used by force-pull to drop unsynced local edits.

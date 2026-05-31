@@ -199,8 +199,8 @@ describe('conflict service', () => {
   it('resolves with VV join plus synthetic bump', async () => {
     const s = store(); const p = new OpProcessor(s); await createNote(p);
     const conflict = await s.createConflict({ vaultId, fileId, kind: 'content', baseHash: null, oursHash: null, theirsHash: null, oursVV: { a: 1 }, theirsVV: { b: 2 } });
-    await new ConflictService(s).claim(conflict.conflictId, deviceId);
-    const resolved = await new ConflictService(s).resolve({ conflictId: conflict.conflictId, deviceId, inlineText: 'merged', resolvedVV: { c: 1 } });
+    await new ConflictService(s).claim(vaultId, userId, deviceId, conflict.conflictId);
+    const resolved = await new ConflictService(s).resolve({ vaultId, userId, conflictId: conflict.conflictId, deviceId, inlineText: 'merged', resolvedVV: { c: 1 } });
     expect(resolved.status).toBe('resolved');
     expect((await s.getFile(vaultId, fileId))!.contentVV).toMatchObject({ a: 1, b: 2, c: 1, [deviceId]: 1 });
   });
@@ -215,8 +215,8 @@ describe('conflict service', () => {
     expect(await s.listBlobRefs(ours)).toContainEqual({ hash: ours, refType: 'conflict_side', refId: `${conflictId}:ours` });
     expect(await s.listBlobRefs(theirs)).toContainEqual({ hash: theirs, refType: 'conflict_side', refId: `${conflictId}:theirs` });
     const cs = new ConflictService(s);
-    await cs.claim(conflictId, deviceId);
-    await cs.resolve({ conflictId, deviceId, resolvedHash: theirs, resolvedVV: { [deviceId]: 2 } });
+    await cs.claim(vaultId, userId, deviceId, conflictId);
+    await cs.resolve({ vaultId, userId, conflictId, deviceId, resolvedHash: theirs, resolvedVV: { [deviceId]: 2 } });
     expect(await s.listBlobRefs(theirs)).toEqual([{ hash: theirs, refType: 'file_live', refId: fileId }]);
     expect(await s.listBlobRefs(ours)).toEqual([]);
     const file = (await s.getFile(vaultId, fileId))!;
@@ -234,8 +234,8 @@ describe('conflict service', () => {
     const conflict = await p.process({ opId: crypto.randomUUID(), deviceId: otherDevice, deviceSeq: 1, fileId, vaultId, kind: 'update', type: 'note', newContentVV: { [otherDevice]: 1 }, contentHash: theirs, blobRef: theirs, size: 10 }, userId);
     const conflictId = conflict.type === 'ack' ? conflict.conflictId! : '';
     const cs = new ConflictService(s);
-    await cs.claim(conflictId, deviceId);
-    await cs.resolve({ conflictId, deviceId, inlineText: 'merged text', resolvedVV: { [deviceId]: 2 } });
+    await cs.claim(vaultId, userId, deviceId, conflictId);
+    await cs.resolve({ vaultId, userId, conflictId, deviceId, inlineText: 'merged text', resolvedVV: { [deviceId]: 2 } });
     expect(await s.listBlobRefs(ours)).toEqual([]);
     expect(await s.listBlobRefs(theirs)).toEqual([]);
     const file = (await s.getFile(vaultId, fileId))!;

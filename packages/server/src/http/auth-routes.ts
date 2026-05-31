@@ -12,6 +12,7 @@ export interface LoginCapable {
     deviceName: string,
     context?: LoginAttemptContext,
   ): Promise<{ accessToken: string; refreshToken: string; deviceId: string }>;
+  refresh(refreshToken: string): Promise<{ accessToken: string; refreshToken: string; deviceId: string }>;
 }
 
 /** Maximum accepted request body for auth endpoints (defends against abuse). */
@@ -22,6 +23,10 @@ const loginRequestSchema = z.object({
   password: z.string().min(1).max(1024),
   vaultId: z.string().min(1).max(200),
   deviceName: z.string().max(200).optional(),
+});
+
+const refreshRequestSchema = z.object({
+  refreshToken: z.string().min(1).max(1024),
 });
 
 /** Map a protocol {@link ErrorCode} to the HTTP status clients should see. */
@@ -76,6 +81,27 @@ export async function handleLogin(auth: LoginCapable, rawBody: string, ip: strin
   try {
     const tokens = await auth.login(username, password, vaultId, deviceName ?? '', { ip });
     return { status: 200, body: tokens };
+  } catch (error) {
+    if (error instanceof SyncError) {
+      return { status: httpStatusForError(error.code), body: { error: error.code, message: error.message } };
+    }
+    return { status: 500, body: { error: ErrorCode.INTERNAL, message: 'Internal error' } };
+  }
+}
+
+export async function handleRefresh(auth: LoginCapable, rawBody: string): Promise<RouteResult> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawBody);
+  } catch {
+    return { status: 400, body: { error: ErrorCode.BAD_REQUEST, message: 'Invalid JSON body' } };
+  }
+  const validated = refreshRequestSchema.safeParse(parsed);
+  if (!validated.success) {
+    return { status: 400, body: { error: ErrorCode.BAD_REQUEST, message: 'Invalid refresh request' } };
+  }
+  try {
+    return { status: 200, body: await auth.refresh(validated.data.refreshToken) };
   } catch (error) {
     if (error instanceof SyncError) {
       return { status: httpStatusForError(error.code), body: { error: error.code, message: error.message } };
@@ -157,7 +183,7 @@ export function createAuthRouter(auth: LoginCapable, options: AuthRouterOptions 
   const trustProxy = options.trustProxy ?? false;
   return async (req, res) => {
     const path = req.url?.split('?', 1)[0];
-    if (path !== '/auth/login') return false;
+    if (path !== '/auth/login' && path !== '/auth/refresh') return false;
     if (req.method !== 'POST') {
       writeJson(res, 405, { error: ErrorCode.BAD_REQUEST, message: 'Method not allowed' });
       return true;
@@ -169,7 +195,9 @@ export function createAuthRouter(auth: LoginCapable, options: AuthRouterOptions 
       res.on('finish', () => req.destroy());
       return true;
     }
-    const result = await handleLogin(auth, body, clientIp(req, trustProxy));
+    const result = path === '/auth/login'
+      ? await handleLogin(auth, body, clientIp(req, trustProxy))
+      : await handleRefresh(auth, body);
     writeJson(res, result.status, result.body);
     return true;
   };

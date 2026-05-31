@@ -2,12 +2,12 @@ import http from 'node:http';
 import { AddressInfo } from 'node:net';
 import { ErrorCode, SyncError } from '@obsidian-sync/shared';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createAuthRouter, clientIp, handleLogin, httpStatusForError, type LoginCapable } from './auth-routes.js';
+import { createAuthRouter, clientIp, handleLogin, handleRefresh, httpStatusForError, type LoginCapable } from './auth-routes.js';
 
 const okResult = { accessToken: 'access.jwt', refreshToken: 'refresh.tok', deviceId: 'dev-1' };
 
-function fakeAuth(login: LoginCapable['login']): LoginCapable {
-  return { login };
+function fakeAuth(login: LoginCapable['login'], refresh: LoginCapable['refresh'] = vi.fn(async () => okResult)): LoginCapable {
+  return { login, refresh };
 }
 
 describe('httpStatusForError', () => {
@@ -54,6 +54,23 @@ describe('handleLogin', () => {
     expect(result.status).toBe(200);
     expect(result.body).toEqual(okResult);
     expect(login).toHaveBeenCalledWith('alice', 'pw', 'v1', 'Laptop', { ip: '203.0.113.7' });
+  });
+
+  describe('handleRefresh', () => {
+    it('returns 200 and rotated tokens for a valid refresh token', async () => {
+      const refresh = vi.fn(async () => okResult);
+      const result = await handleRefresh(fakeAuth(vi.fn(async () => okResult), refresh), JSON.stringify({ refreshToken: 'refresh-1' }));
+      expect(result.status).toBe(200);
+      expect(result.body).toEqual(okResult);
+      expect(refresh).toHaveBeenCalledWith('refresh-1');
+    });
+
+    it('returns 400 when refreshToken is missing', async () => {
+      const refresh = vi.fn(async () => okResult);
+      const result = await handleRefresh(fakeAuth(vi.fn(async () => okResult), refresh), JSON.stringify({}));
+      expect(result.status).toBe(400);
+      expect(refresh).not.toHaveBeenCalled();
+    });
   });
 
   it('defaults deviceName to empty string and ignores unknown fields (e.g. deviceId)', async () => {
@@ -114,7 +131,7 @@ describe('createAuthRouter (real HTTP roundtrip)', () => {
 
   beforeEach(async () => {
     loginImpl = async () => okResult;
-    const router = createAuthRouter({ login: (...a) => loginImpl(...a) });
+    const router = createAuthRouter({ login: (...a) => loginImpl(...a), refresh: async () => okResult });
     server = http.createServer((req, res) => {
       void router(req, res).then((handled) => {
         if (!handled) {
@@ -145,6 +162,16 @@ describe('createAuthRouter (real HTTP roundtrip)', () => {
   it('returns 405 for non-POST on /auth/login', async () => {
     const res = await fetch(`${baseUrl}/auth/login`, { method: 'GET' });
     expect(res.status).toBe(405);
+  });
+
+  it('handles POST /auth/refresh end-to-end', async () => {
+    const res = await fetch(`${baseUrl}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ refreshToken: 'refresh-1' }),
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(okResult);
   });
 
   it('does not handle unrelated paths (router returns false → 404)', async () => {

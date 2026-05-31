@@ -57,6 +57,19 @@ export class AuthService {
     }
   }
 
+  async refresh(refreshToken: string): Promise<{ accessToken: string; refreshToken: string; deviceId: string }> {
+    let deviceId = '';
+    const rotated = await this.tokens.rotateRefresh(refreshToken, async (record) => {
+      const device = await this.repo.getDevice(record.deviceId);
+      if (!device || device.revoked || device.userId !== record.userId) throw new SyncError(ErrorCode.DEVICE_REVOKED, 'Device is not valid');
+      const member = await this.repo.getMember(device.vaultId, record.userId);
+      if (!member) throw new SyncError(ErrorCode.FORBIDDEN, 'No vault access');
+      deviceId = device.deviceId;
+      return { userId: record.userId, vaultId: device.vaultId, deviceId: device.deviceId, role: member.role };
+    });
+    return { ...rotated, deviceId };
+  }
+
   async requireRole(vaultId: string, userId: string, minimum: Role): Promise<Role> {
     const member = await this.repo.getMember(vaultId, userId);
     if (!member) throw new SyncError(ErrorCode.FORBIDDEN, 'No vault access');

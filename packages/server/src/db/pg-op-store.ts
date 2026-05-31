@@ -1,4 +1,4 @@
-import type { AppliedOp, ConflictRecord, ContentEncryptionEncoding, FileOp, FileType, PathClock, VersionVector } from '@obsidian-sync/shared';
+import { ErrorCode, SyncError, type AppliedOp, type ConflictRecord, type ConflictStatus, type ContentEncryptionEncoding, type FileOp, type FileType, type PathClock, type VersionVector } from '@obsidian-sync/shared';
 import { type BlobRecord, type BlobRef, type ManifestCursor, type OpApplyResult, type OpDataStore, type Role, type StoredDevice, type StoredFile, type StoredOp, toManifestEntry } from '../engine/store.js';
 import { PgDatabase, type Queryable } from './pool.js';
 
@@ -40,11 +40,32 @@ export class PgOpDataStore implements OpDataStore {
   async addBlobRef(r: BlobRef): Promise<void> { await this.db.query('INSERT INTO blob_refs(hash,ref_type,ref_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [r.hash, r.refType, r.refId]); }
   async removeBlobRef(hash: string, refType: BlobRef['refType'], refId: string): Promise<void> { await this.db.query('DELETE FROM blob_refs WHERE hash=$1 AND ref_type=$2 AND ref_id=$3', [hash, refType, refId]); }
   async listBlobRefs(hash: string): Promise<BlobRef[]> { return (await this.db.query<{ hash: string; ref_type: BlobRef['refType']; ref_id: string }>('SELECT hash,ref_type,ref_id FROM blob_refs WHERE hash=$1', [hash])).rows.map((r) => ({ hash: r.hash, refType: r.ref_type, refId: r.ref_id })); }
-  async createConflict(input: Omit<ConflictRecord, 'conflictId' | 'status'>): Promise<ConflictRecord> { const r = (await this.db.query<ConflictRow>('INSERT INTO conflicts(vault_id,file_id,kind,base_hash,ours_hash,theirs_hash,ours_vv,theirs_vv) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(file_id,kind,ours_hash,theirs_hash) DO UPDATE SET status=conflicts.status RETURNING *', [input.vaultId, input.fileId, input.kind, input.baseHash, input.oursHash, input.theirsHash, input.oursVV, input.theirsVV])).rows[0]!; return mapConflict(r); }
+  async createConflict(input: Omit<ConflictRecord, 'conflictId' | 'status'>): Promise<ConflictRecord> { const r = (await this.db.query<ConflictRow>("INSERT INTO conflicts(vault_id,file_id,kind,base_hash,ours_hash,theirs_hash,ours_vv,theirs_vv) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(file_id,kind,COALESCE(ours_hash, ''),COALESCE(theirs_hash, '')) WHERE status <> 'resolved' DO UPDATE SET status=conflicts.status RETURNING *", [input.vaultId, input.fileId, input.kind, input.baseHash, input.oursHash, input.theirsHash, input.oursVV, input.theirsVV])).rows[0]!; return mapConflict(r); }
   async getConflict(conflictId: string): Promise<ConflictRecord | null> { const r = (await this.db.query<ConflictRow>('SELECT * FROM conflicts WHERE conflict_id=$1', [conflictId])).rows[0]; return r ? mapConflict(r) : null; }
-  async saveConflict(c: ConflictRecord): Promise<void> { await this.db.query('UPDATE conflicts SET status=$2,claimed_by=$3,resolved_by=$4,resolved_hash=$5,resolved_vv=$6,resolved_at=CASE WHEN $2=$7 THEN now() ELSE resolved_at END WHERE conflict_id=$1', [c.conflictId, c.status, c.claimedBy ?? null, (c as { resolvedBy?: string }).resolvedBy ?? null, (c as { resolvedHash?: string }).resolvedHash ?? null, (c as { resolvedVV?: VersionVector }).resolvedVV ?? null, 'resolved']); }
+  async saveConflict(c: ConflictRecord): Promise<void> {
+    const result = await this.db.query('UPDATE conflicts SET status=$2,claimed_by=$3,resolved_by=$4,resolved_hash=$5,resolved_vv=$6,resolved_at=CASE WHEN $2=$7 THEN now() ELSE resolved_at END WHERE conflict_id=$1 AND (status <> $7 OR $2 = $7)', [c.conflictId, c.status, c.claimedBy ?? null, (c as { resolvedBy?: string }).resolvedBy ?? null, (c as { resolvedHash?: string }).resolvedHash ?? null, (c as { resolvedVV?: VersionVector }).resolvedVV ?? null, 'resolved']);
+    if ((result.rowCount ?? 0) === 0 && c.status !== 'resolved') throw new SyncError(ErrorCode.CONFLICT_ALREADY_RESOLVED, 'Conflict already resolved');
+  }
+  async compareAndSetConflict(c: ConflictRecord, expected: { status: ConflictStatus; claimedBy?: string | null }): Promise<boolean> {
+    const result = await this.db.query(
+      'UPDATE conflicts SET status=$2,claimed_by=$3,resolved_by=$4,resolved_hash=$5,resolved_vv=$6,resolved_at=CASE WHEN $2=$7 THEN now() ELSE resolved_at END WHERE conflict_id=$1 AND status=$8 AND claimed_by IS NOT DISTINCT FROM $9',
+      [c.conflictId, c.status, c.claimedBy ?? null, (c as { resolvedBy?: string }).resolvedBy ?? null, (c as { resolvedHash?: string }).resolvedHash ?? null, (c as { resolvedVV?: VersionVector }).resolvedVV ?? null, 'resolved', expected.status, expected.claimedBy ?? null],
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
   async listManifest(vaultId: string, cursor: ManifestCursor | null, limit: number) { const params: unknown[] = [vaultId, limit]; const cond = cursor ? 'AND (path_normalized,file_id) > ($3,$4)' : ''; if (cursor) params.push(cursor.pathNormalized, cursor.fileId); const rows = (await this.db.query<FileRow>(`SELECT * FROM files WHERE vault_id=$1 AND deleted=false ${cond} ORDER BY path_normalized,file_id LIMIT $2`, params)).rows; const items = rows.map((r) => toManifestEntry(mapFile(r)!)); const last = rows.at(-1); return { items, nextCursor: rows.length === limit && last ? { pathNormalized: last.path_normalized, fileId: last.file_id } : null }; }
   async listTrash(vaultId: string): Promise<StoredFile[]> { return (await this.db.query<FileRow>('SELECT * FROM files WHERE vault_id=$1 AND deleted=true ORDER BY deleted_at ASC', [vaultId])).rows.map((r) => mapFile(r)!); }
+  async hasContentForVault(vaultId: string, hash: string): Promise<boolean> {
+    return Boolean((await this.db.query<{ exists: boolean }>(`
+      SELECT EXISTS(
+        SELECT 1 FROM files WHERE vault_id=$1 AND content_hash=$2
+        UNION ALL
+        SELECT 1 FROM conflicts WHERE vault_id=$1 AND $2 IN (base_hash, ours_hash, theirs_hash, resolved_hash)
+        UNION ALL
+        SELECT 1 FROM file_ops WHERE vault_id=$1 AND ((payload->>'contentHash') = $2 OR (payload->>'blobRef') = $2)
+      ) AS exists
+    `, [vaultId, hash])).rows[0]?.exists);
+  }
   async getContent(hash: string): Promise<Uint8Array | null> { const r = (await this.db.query<{ text: Buffer }>('SELECT text FROM note_content WHERE content_hash=$1', [hash])).rows[0]; return r ? new Uint8Array(r.text) : null; }
   async putContent(hash: string, bytes: Uint8Array): Promise<void> { await this.db.query('INSERT INTO note_content(content_hash,text,size) VALUES($1,$2,$3) ON CONFLICT DO NOTHING', [hash, Buffer.from(bytes), bytes.byteLength]); }
 }
