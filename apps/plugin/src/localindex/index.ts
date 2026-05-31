@@ -46,6 +46,10 @@ function isDestinationExistsError(error: unknown): boolean {
   return error instanceof Error && /destination file already exist/i.test(error.message);
 }
 
+function isMissingPathError(error: unknown): boolean {
+  return error instanceof Error && (/enoent/i.test(error.message) || /no such file or directory/i.test(error.message));
+}
+
 function defaultDeviceState(deviceId: string, vaultId: string | null): DeviceState {
   return {
     appliedSeq: 0,
@@ -117,11 +121,20 @@ export class LocalIndexStore {
       }
     } else {
       await this.adapter.write(this.path, text);
-      if (this.adapter.remove) await this.adapter.remove(tmp);
+      await this.cleanupTemp(tmp);
       return;
     }
     await this.adapter.write(this.path, text);
-    if (this.adapter.remove) await this.adapter.remove(tmp);
+    await this.cleanupTemp(tmp);
+  }
+
+  private async cleanupTemp(path: string): Promise<void> {
+    if (!this.adapter.remove) return;
+    try {
+      await this.adapter.remove(path);
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error;
+    }
   }
 
   upsertFile(entry: Omit<FileIndexEntry, "pathNormalized"> & Partial<Pick<FileIndexEntry, "pathNormalized">>): void {
