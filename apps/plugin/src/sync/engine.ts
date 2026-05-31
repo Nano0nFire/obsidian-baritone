@@ -57,6 +57,7 @@ export class SyncEngine {
   private lamport = 0;
   private state: EngineState = "idle";
   private unsubscribe: Array<() => void> = [];
+  private readonly forceWaiters = new Map<string, (result: { ok: boolean; message?: string }) => void>();
 
   constructor(
     private readonly settings: PluginSettings,
@@ -110,6 +111,11 @@ export class SyncEngine {
     const entry = this.index.byFileId(fileId);
     const base = entry?.appliedContentVV ?? {};
     const next = bump(base, this.settings.deviceId);
+    const payload = await this.buildContentPayload(fileId, path, textOrBytes);
+    return { vaultId: this.settings.vaultId, fileId, kind: entry ? "update" : "create", type, baseContentVV: base, newContentVV: next, ...payload };
+  }
+
+  private async buildContentPayload(fileId: string, path: string, textOrBytes?: string | Uint8Array): Promise<Pick<FileOpDraft, "contentHash" | "size" | "inlineText" | "blobRef" | "contentEncoding">> {
     let contentHashValue: string;
     let size: number;
     let inlineText: string | undefined;
@@ -133,8 +139,80 @@ export class SyncEngine {
       size = bytes.byteLength;
       blobRef = contentHashValue;
     }
-    return { vaultId: this.settings.vaultId, fileId, kind: entry ? "update" : "create", type, baseContentVV: base, newContentVV: next, contentHash: contentHashValue, size, contentEncoding, inlineText, blobRef };
+    return { contentHash: contentHashValue, size, inlineText, blobRef, contentEncoding };
   }
+
+  /**
+   * Build a content op whose newContentVV strictly dominates `dominateVV` (the
+   * remote file's current contentVV), so a force-push unconditionally overwrites
+   * the server copy. `remoteExists` selects create vs update kind.
+   */
+  async makeForcedContentOp(fileId: string, path: string, type: FileType, dominateVV: VersionVector, remoteExists: boolean): Promise<FileOpDraft> {
+    const entry = this.index.byFileId(fileId);
+    const base = entry?.appliedContentVV ?? {};
+    const next = bump(join(base, dominateVV), this.settings.deviceId);
+    const payload = await this.buildContentPayload(fileId, path);
+    return { vaultId: this.settings.vaultId, fileId, kind: remoteExists ? "update" : "create", type, newPath: path, baseContentVV: base, newContentVV: next, ...payload };
+  }
+
+  /**
+   * Serialized force send: enqueue + send a single op and await its ack/reject.
+   * On success the local index is upserted (own-ops never echo back, so this is
+   * required to keep future edits dominating). On terminal failure the op is
+   * rolled back to keep the deviceSeq stream gap-free.
+   */
+  async pushForced(draft: FileOpDraft): Promise<{ ok: boolean; message?: string }> {
+    const op = this.outbox.enqueue(draft);
+    await this.persistOutbox();
+    const result = await new Promise<{ ok: boolean; message?: string }>((resolve) => {
+      this.forceWaiters.set(op.opId, resolve);
+      if (this.transport.readyState === "open") {
+        this.outbox.markInflight(op.opId);
+        this.transport.send({ t: "file_op", op });
+      } else {
+        this.forceWaiters.delete(op.opId);
+        resolve({ ok: false, message: "transport not connected" });
+      }
+    });
+    if (result.ok) {
+      this.applyForcedToIndex(op);
+    } else {
+      this.outbox.rollbackLast(op.opId) || this.outbox.reject(op.opId, result.message ?? "rejected", true);
+    }
+    await this.persistOutbox();
+    return result;
+  }
+
+  private applyForcedToIndex(op: FileOp): void {
+    if (op.kind === "delete") {
+      this.index.markDeleted(op.fileId);
+      return;
+    }
+    const entry = this.index.byFileId(op.fileId);
+    const path = op.newPath ?? entry?.path;
+    if (!path || !op.contentHash) return;
+    this.index.upsertFile({
+      fileId: op.fileId,
+      path,
+      type: op.type,
+      contentHash: op.contentHash,
+      size: op.size ?? 0,
+      appliedContentVV: op.newContentVV ?? {},
+      pathClock: entry?.pathClock,
+      isDir: false,
+      mtime: Date.now(),
+      deleted: false,
+    });
+  }
+
+  /** Drop never-sent queued ops and rewind the seq (used before a force-pull). */
+  async discardUnsentOutbox(): Promise<{ discarded: number; blockedByInflight: boolean }> {
+    const result = this.outbox.discardUnsent();
+    await this.persistOutbox();
+    return result;
+  }
+
+  hasConflicts(): boolean { return this.index.data.conflicts.length > 0; }
 
   async hashPath(path: string): Promise<string> {
     if (!this.isEncryptionEnabled()) {
@@ -238,10 +316,21 @@ export class SyncEngine {
     else this.outbox.ack(message.opId, message.vaultSeq);
     this.index.setAppliedSeq(message.vaultSeq);
     await this.persistOutbox();
+    const waiter = this.forceWaiters.get(message.opId);
+    if (waiter) {
+      this.forceWaiters.delete(message.opId);
+      waiter(message.conflictId ? { ok: false, message: `conflict ${message.conflictId}` } : { ok: true });
+    }
   }
 
   private async handleReject(message: RejectMessage): Promise<void> {
     if (!message.opId) return;
+    const waiter = this.forceWaiters.get(message.opId);
+    if (waiter) {
+      this.forceWaiters.delete(message.opId);
+      waiter({ ok: false, message: `${message.code}: ${message.message}` });
+      return;
+    }
     if (message.code === ErrorCode.SEQ_GAP || message.code === ErrorCode.STALE) {
       this.outbox.reject(message.opId, message.message, false);
       this.transport.send({ t: "get_ops", sinceSeq: this.index.device.appliedSeq });

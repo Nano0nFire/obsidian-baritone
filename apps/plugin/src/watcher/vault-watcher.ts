@@ -18,10 +18,25 @@ function classify(path: string): FileType {
 export class VaultWatcher {
   private timer: ReturnType<typeof setTimeout> | null = null;
   private queued = new Set<string>();
+  private suspended = false;
 
   constructor(private readonly vault: VaultIO, private readonly index: LocalIndexStore, private readonly engine: SyncEngine, private readonly ignore: SyncIgnore) {}
 
+  /** Stop reacting to vault events. Used around destructive force operations so
+   * locally-applied remote writes/deletes are not echoed back to the server. */
+  suspend(): void {
+    this.suspended = true;
+    this.queued.clear();
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  resume(): void { this.suspended = false; }
+
+  get isSuspended(): boolean { return this.suspended; }
+
   queuePath(path: string): void {
+    if (this.suspended) return;
     try {
       const canonical = canonicalVaultPath(path);
       if (this.ignore.ignores(canonical) || this.engine.isRealtimeActivePath(canonical)) return;
@@ -34,6 +49,7 @@ export class VaultWatcher {
   }
 
   async flush(): Promise<void> {
+    if (this.suspended) return;
     const paths = [...this.queued];
     this.queued.clear();
     if (this.timer) clearTimeout(this.timer);
@@ -42,6 +58,7 @@ export class VaultWatcher {
   }
 
   async reconcile(): Promise<void> {
+    if (this.suspended) return;
     const disk = await Promise.all(this.vault.listFiles()
       .map((file) => file.path)
       .filter((path) => !this.ignore.ignores(path))
@@ -58,6 +75,7 @@ export class VaultWatcher {
   }
 
   async handleRename(oldPath: string, newPath: string): Promise<void> {
+    if (this.suspended) return;
     const oldCanonical = canonicalVaultPath(oldPath);
     const newCanonical = canonicalVaultPath(newPath);
     if (this.ignore.ignores(newCanonical)) return;
@@ -68,6 +86,7 @@ export class VaultWatcher {
   }
 
   async handleDelete(path: string): Promise<void> {
+    if (this.suspended) return;
     const entry = this.index.byPath(canonicalVaultPath(path));
     if (!entry || this.engine.isRealtimeActiveFile(entry.fileId)) return;
     await this.engine.enqueueLocalChange(this.engine.makeDeleteOp(entry.fileId, entry.type));

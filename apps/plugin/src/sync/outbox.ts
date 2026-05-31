@@ -77,6 +77,40 @@ export class OutboxManager {
     this.map.delete(opId);
   }
 
+  /**
+   * Roll back the most-recently enqueued op (highest deviceSeq) after a terminal
+   * reject, freeing its deviceSeq so the stream stays gap-free. Only valid for
+   * the op holding the highest seq (the one just sent in a serialized flush).
+   */
+  rollbackLast(opId: string): boolean {
+    const entry = this.map.get(opId);
+    if (!entry || entry.op.deviceSeq !== this._nextDeviceSeq - 1) return false;
+    this.map.delete(opId);
+    this._nextDeviceSeq -= 1;
+    return true;
+  }
+
+  /**
+   * Discard never-sent ("queued") ops and rewind nextDeviceSeq so the device's
+   * sequence stays contiguous. Used by force-pull to drop unsynced local edits.
+   * Refuses (blockedByInflight) when any op is inflight, since the server may
+   * already have consumed that seq.
+   */
+  discardUnsent(): { discarded: number; blockedByInflight: boolean } {
+    const all = this.entries;
+    if (all.some((entry) => entry.status === "inflight")) return { discarded: 0, blockedByInflight: true };
+    const queued = all.filter((entry) => entry.status === "queued");
+    if (queued.length === 0) return { discarded: 0, blockedByInflight: false };
+    const lowestQueuedSeq = Math.min(...queued.map((entry) => entry.op.deviceSeq));
+    // Only safe when nothing with a higher seq was already accepted by the server.
+    if (all.some((entry) => entry.status !== "queued" && entry.op.deviceSeq > lowestQueuedSeq)) {
+      return { discarded: 0, blockedByInflight: true };
+    }
+    for (const entry of queued) this.map.delete(entry.op.opId);
+    this._nextDeviceSeq = lowestQueuedSeq;
+    return { discarded: queued.length, blockedByInflight: false };
+  }
+
   retryable(): OutboxEntry[] {
     return this.entries.filter((entry) => entry.status === "queued" || entry.status === "inflight");
   }
