@@ -6,10 +6,42 @@ Self-hosted Obsidian client for real-time vault sync, file-level reconciliation,
 
 1. Install and enable the Obsidian BRAT community plugin.
 2. In BRAT settings, choose **Add Beta plugin**.
-3. Enter this repository URL: `https://github.com/Nano0nFire/obsidian-baritone`.
+3. Enter exactly this repository (no subpath): `Nano0nFire/obsidian-baritone`
+   (or the URL `https://github.com/Nano0nFire/obsidian-baritone`). Do **not**
+   append `/apps/plugin` or `/tree/...` — BRAT reads release assets, not paths.
 4. Enable **Obsidian Sync** after BRAT installs or updates it.
 
-Use BRAT only for beta testing against releases or branches you trust.
+> This repository is **private**. Before adding the plugin, open BRAT settings →
+> **Personal Access Token** and provide a GitHub token that can read this repo's
+> releases: either a **classic PAT with the `repo` scope**, or a **fine-grained
+> PAT** scoped to `Nano0nFire/obsidian-baritone` with **Contents: Read-only**.
+> (If your account uses SSO, authorize the token for the org, and mind token
+> expiry.) See BRAT's "Accessing Private Repositories" docs.
+
+> GitHub Releases in this repository are **reserved for the plugin**. The sync
+> server is deployed from source/Docker (`deploy/`), not via GitHub Releases, so
+> BRAT always finds plugin assets on the highest-version release.
+
+BRAT installs the plugin from the **GitHub Release with the highest version tag**,
+reading the `main.js`, `manifest.json`, and `styles.css` assets attached to it.
+Those assets are produced automatically by the `Release Plugin` GitHub Actions
+workflow whenever a `MAJOR.MINOR.PATCH` tag is pushed (see
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml)). Use BRAT
+only for beta testing against releases you trust.
+
+### Cutting a new release (maintainers)
+
+```bash
+npm run version-bump --workspace obsidian-sync-plugin 0.2.0   # syncs manifest/package/versions
+git commit -am "release: plugin 0.2.0"
+git push
+git tag 0.2.0 && git push origin 0.2.0   # tag must equal the manifest version
+```
+
+The workflow verifies the tag matches the manifest version, builds the plugin,
+and publishes (or updates) the release with the three BRAT assets. Tags with a
+prerelease suffix (e.g. `0.2.0-beta.1`) are published as prereleases for BRAT's
+beta channel.
 
 ## Manual install
 

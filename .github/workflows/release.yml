@@ -1,0 +1,101 @@
+name: Release Plugin
+
+# Publishes the Obsidian plugin as a GitHub Release whose assets
+# (main.js, manifest.json, styles.css) are consumed directly by BRAT
+# (Beta Reviewer's Auto-update Tool). BRAT ignores the repository layout and
+# only reads release assets, so this monorepo works as long as each plugin
+# release carries those three files and the highest semver tag.
+#
+# IMPORTANT (monorepo): BRAT lists ALL of this repo's GitHub Releases and picks
+# the one with the highest semver-coerced tag. GitHub Releases in this repo are
+# therefore RESERVED FOR THE PLUGIN. The server is distributed via Docker/source
+# (deploy/), NOT via GitHub Releases. Do not publish server releases here or BRAT
+# may select a release with no plugin assets.
+#
+# Trigger by pushing a bare semver tag that matches the plugin manifest version:
+#   npm run version-bump --workspace obsidian-sync-plugin 0.2.0
+#   git commit -am "release: plugin 0.2.0" && git push
+#   git tag 0.2.0 && git push origin 0.2.0
+# Prerelease (beta) channel: tag with a prerelease suffix, e.g. 0.2.0-beta.1.
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing git tag to (re)build a release for"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # On a tag push github.ref is the tag; on manual dispatch check out the
+          # requested tag so we never build master while publishing onto a tag.
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve tag
+        id: tag
+        run: echo "tag=${{ github.event.inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify tag matches plugin manifest version
+        run: node scripts/verify-release-version.mjs "${{ steps.tag.outputs.tag }}"
+        working-directory: apps/plugin
+
+      - name: Build shared package
+        run: npm run build --workspace @obsidian-sync/shared
+
+      - name: Build plugin
+        run: npm run build --workspace obsidian-sync-plugin
+
+      - name: Verify BRAT release artifacts exist
+        run: |
+          set -euo pipefail
+          for f in main.js manifest.json styles.css; do
+            test -f "apps/plugin/dist/$f" || { echo "missing apps/plugin/dist/$f"; exit 1; }
+          done
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          prerelease=()
+          case "$tag" in *-*) prerelease=(--prerelease);; esac
+          assets=(
+            apps/plugin/dist/main.js
+            apps/plugin/dist/manifest.json
+            apps/plugin/dist/styles.css
+          )
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+            is_pre=false
+            case "$tag" in *-*) is_pre=true;; esac
+            gh release edit "$tag" --title "$tag" --prerelease="$is_pre"
+          else
+            gh release create "$tag" "${assets[@]}" \
+              --title "$tag" \
+              --generate-notes \
+              --verify-tag \
+              "${prerelease[@]}"
+          fi
