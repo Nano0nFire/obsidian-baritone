@@ -62,6 +62,23 @@ class LoginModal extends Modal {
   }
 }
 
+class ForceConfirmModal extends Modal {
+  private typed = "";
+  constructor(app: App, private readonly opts: { title: string; warning: string; confirmPhrase: string; confirmLabel: string; onConfirm: () => void | Promise<void>; }) { super(app); }
+  override onOpen(): void {
+    this.contentEl.empty();
+    this.contentEl.createEl("h2", { text: this.opts.title });
+    this.contentEl.createEl("p", { text: this.opts.warning, cls: "mod-warning" });
+    this.contentEl.createEl("p", { text: `Type “${this.opts.confirmPhrase}” to confirm.`, cls: "setting-item-description" });
+    let confirmButton: { setDisabled(v: boolean): unknown } | null = null;
+    new Setting(this.contentEl).setName("Confirmation").addText((text) => text.setPlaceholder(this.opts.confirmPhrase).onChange((value) => { this.typed = value; confirmButton?.setDisabled(this.typed !== this.opts.confirmPhrase); }));
+    new Setting(this.contentEl)
+      .addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((button) => { confirmButton = button; button.setButtonText(this.opts.confirmLabel).setWarning().setDisabled(true).onClick(async () => { if (this.typed !== this.opts.confirmPhrase) return; this.close(); await this.opts.onConfirm(); }); });
+  }
+  override onClose(): void { this.contentEl.empty(); }
+}
+
 export class ObsidianSyncSettingTab extends PluginSettingTab {
   constructor(app: App, private readonly plugin: ObsidianSyncPlugin) { super(app, plugin); }
 
@@ -102,6 +119,37 @@ export class ObsidianSyncSettingTab extends PluginSettingTab {
         .setButtonText(this.plugin.settings.contentEncryption.enabled ? "Disable" : "Enable")
         .onClick(() => new EncryptionPassphraseModal(this.app, this.plugin, !this.plugin.settings.contentEncryption.enabled).open()));
     new Setting(containerEl).setName("Pause sync").addToggle((toggle) => toggle.setValue(this.plugin.settings.paused).onChange(async (value) => { this.plugin.settings.paused = value; await this.plugin.saveSettingsAndRestart(); }));
+    containerEl.createEl("h3", { text: "Danger zone — force overwrite" });
+    containerEl.createEl("p", {
+      text: "Force operations bypass conflict detection and overwrite one side wholesale. They run only while connected and not paused; files outside sync scope (ignored, device-local config) are never touched.",
+      cls: "setting-item-description",
+    });
+    new Setting(containerEl)
+      .setName("Force push (local → remote)")
+      .setDesc("Make the server match THIS device: overwrite changed remote files and delete remote files missing locally.")
+      .addButton((button) => button
+        .setButtonText("Force push")
+        .setWarning()
+        .onClick(() => new ForceConfirmModal(this.app, {
+          title: "Force push local over remote",
+          warning: "This overwrites the server copy of this vault with your local files and deletes server files that don't exist locally. Other devices will receive these deletions. This cannot be undone.",
+          confirmPhrase: "overwrite remote",
+          confirmLabel: "Force push",
+          onConfirm: () => this.plugin.forcePushToRemote(),
+        }).open()));
+    new Setting(containerEl)
+      .setName("Force pull (remote → local)")
+      .setDesc("Make THIS device match the server: overwrite local files and move local files missing on the server to trash.")
+      .addButton((button) => button
+        .setButtonText("Force pull")
+        .setWarning()
+        .onClick(() => new ForceConfirmModal(this.app, {
+          title: "Force pull remote over local",
+          warning: `This overwrites your local files with the server copy and moves local-only files to ${this.plugin.settings.remoteDeleteTarget === "system-trash" ? "the system trash" : "the Obsidian .trash"}. Unsynced local edits will be discarded. This cannot be undone.`,
+          confirmPhrase: "overwrite local",
+          confirmLabel: "Force pull",
+          onConfirm: () => this.plugin.forcePullFromRemote(),
+        }).open()));
     containerEl.createEl("h3", { text: "Config sync" });
     containerEl.createEl("p", {
       text: "Choose whether each Obsidian configuration category uses the shared COMMON settings or remains DEVICE-LOCAL on this client.",

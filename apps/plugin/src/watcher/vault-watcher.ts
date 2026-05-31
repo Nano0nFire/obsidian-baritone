@@ -10,9 +10,13 @@ function newFileId(): string {
   return globalThis.crypto?.randomUUID?.() ?? `file-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
-function classify(path: string): FileType {
+export function classifyFileType(path: string): FileType {
   if (path.startsWith(".obsidian/")) return "config";
   return isTextPath(path) ? "note" : "attachment";
+}
+
+function classify(path: string): FileType {
+  return classifyFileType(path);
 }
 
 export class VaultWatcher {

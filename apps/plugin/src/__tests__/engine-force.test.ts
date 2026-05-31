@@ -68,7 +68,7 @@ describe("SyncEngine force push", () => {
     const promise = engine.pushForced(draft);
     const op = await transport.waitForOp();
     expect(op.kind).toBe("update");
-    await transport.deliver({ t: "op_ack", opId: op.opId, vaultSeq: 7 });
+    await transport.deliver({ t: "op_ack", opId: op.opId, vaultSeq: 7, resultingClocks: { epoch: 0 } });
     const result = await promise;
 
     expect(result.ok).toBe(true);

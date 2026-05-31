@@ -112,6 +112,10 @@ export class LocalIndexStore {
     if (entry) entry.deleted = true;
   }
 
+  removeFileId(fileId: string): void {
+    this.snapshot.files = this.snapshot.files.filter((entry) => entry.fileId !== fileId);
+  }
+
   setAppliedSeq(seq: number): void { this.snapshot.device.appliedSeq = Math.max(this.snapshot.device.appliedSeq, seq); }
   setOutbox(outbox: OutboxEntry[], nextDeviceSeq: number): void {
     this.snapshot.device.outbox = outbox;

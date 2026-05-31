@@ -177,7 +177,7 @@ export class SyncEngine {
     if (result.ok) {
       this.applyForcedToIndex(op);
     } else {
-      this.outbox.rollbackLast(op.opId) || this.outbox.reject(op.opId, result.message ?? "rejected", true);
+      if (!this.outbox.rollbackLast(op.opId)) this.outbox.reject(op.opId, result.message ?? "rejected", true);
     }
     await this.persistOutbox();
     return result;

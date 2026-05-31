@@ -34,7 +34,24 @@ export class InitialSyncRunner {
     this.transport.send({ t: "get_ops", sinceSeq: watermark });
   }
 
-  private async applyManifestEntry(entry: ManifestEntry): Promise<void> {
+  /** Page through the full live manifest without mutating local state. Single
+   * consumer of the manifest stream — callers must not page concurrently. */
+  async fetchManifest(): Promise<{ entries: ManifestEntry[]; watermarkSeq: number }> {
+    const entries: ManifestEntry[] = [];
+    let cursor: string | undefined;
+    let watermark = 0;
+    do {
+      const pagePromise = this.transport.waitFor("manifest_page", (msg): msg is ManifestPageMessage => msg.nextCursor !== undefined);
+      this.transport.send({ t: "get_manifest", vaultId: this.vaultId, cursor });
+      const page = await pagePromise;
+      watermark = page.watermarkSeq;
+      entries.push(...page.items);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return { entries, watermarkSeq: watermark };
+  }
+
+  async applyManifestEntry(entry: ManifestEntry): Promise<void> {
     if (entry.deleted || !entry.contentHash) return;
     let bytes: Uint8Array;
     const canUseLocalCache = !entry.contentEncoding && this.index.device.downloadedHashes.includes(entry.contentHash) && this.vault.exists(entry.path);

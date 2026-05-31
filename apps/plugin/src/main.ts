@@ -12,7 +12,10 @@ import { SyncEngine } from "./sync/engine.js";
 import { YjsSessionManager, type YjsSession } from "./sync/yjs-session.js";
 import { makeLocalAwarenessState, reduceAwarenessStates, type PresenceParticipant } from "./sync/awareness-ui.js";
 import { InitialSyncRunner } from "./sync/initial-sync.js";
-import { VaultWatcher } from "./watcher/vault-watcher.js";
+import { ForceSyncRunner } from "./sync/force-runner.js";
+import { VaultWatcher, classifyFileType } from "./watcher/vault-watcher.js";
+import { canonicalVaultPath } from "./pathing.js";
+import type { LocalFileSnapshot } from "./sync/force-sync.js";
 import { ConflictStore } from "./conflict/conflict-store.js";
 import { ConflictPanel, VIEW_TYPE_CONFLICTS } from "./conflict/conflict-panel.js";
 import { ManualChoiceModal, TextMergeModal, conflictResolvedVV } from "./conflict/merge-view.js";
@@ -159,6 +162,9 @@ export default class ObsidianSyncPlugin extends Plugin {
   private contentEncryptionKey: VaultContentKey | null = null;
   private activeAwarenessCleanup: (() => void) | null = null;
   private readonly yjsEditorExtensions: Extension[] = [];
+  private vaultIO!: VaultIO;
+  private ignore!: SyncIgnore;
+  private forceSyncInProgress = false;
 
   override async onload(): Promise<void> {
     await this.loadSettings();
@@ -175,12 +181,14 @@ export default class ObsidianSyncPlugin extends Plugin {
       },
     });
     const vaultIO = new ObsidianVaultIO(this);
+    this.vaultIO = vaultIO;
     this.engine = new SyncEngine(this.settings, this.index, vaultIO, this.transport, {
       onState: (state, detail) => this.setStatus(detail ? `${state}: ${detail}` : state),
       onConflict: (conflict) => { this.conflictStore.upsert(conflict); new Notice("Sync conflict requires manual resolution"); },
       onError: (error) => new Notice(`Sync error: ${error.message}`),
     }, this.yjsManager, () => this.contentEncryptionKey);
     const ignore = new SyncIgnore({ common: parseIgnoreLines(this.settings.commonIgnore), local: [...parseIgnoreLines(this.settings.localIgnore), ...localConfigIgnorePatterns(this.settings)] });
+    this.ignore = ignore;
     this.watcher = new VaultWatcher(vaultIO, this.index, this.engine, ignore);
     this.statusEl = this.addStatusBarItem();
     this.presenceEl = this.addStatusBarItem();
@@ -213,6 +221,61 @@ export default class ObsidianSyncPlugin extends Plugin {
   }
 
   encryptionUnlocked(): boolean { return !this.settings.contentEncryption.enabled || this.contentEncryptionKey !== null; }
+
+  private buildForceRunner(): ForceSyncRunner {
+    const manifest = new InitialSyncRunner(this.transport, this.index, this.vaultIO, this.settings.vaultId, () => this.contentEncryptionKey);
+    return new ForceSyncRunner(this.engine, manifest, this.index, this.vaultIO, this.watcher, { remoteDeleteSystemTrash: this.settings.remoteDeleteTarget === "system-trash" });
+  }
+
+  private syncableLocalPaths(): string[] {
+    return this.vaultIO.listFiles()
+      .map((file) => canonicalVaultPath(file.path))
+      .filter((path) => !this.ignore.ignores(path));
+  }
+
+  private guardForce(): boolean {
+    if (this.forceSyncInProgress) { new Notice("A force sync is already running."); return false; }
+    if (this.settings.paused) { new Notice("Resume sync before running a force operation."); return false; }
+    if (this.transport.readyState !== "open") { new Notice("Not connected to the server. Wait for the connection to open, then retry."); return false; }
+    if (!this.encryptionUnlocked()) { new Notice("Unlock vault encryption before running a force operation."); return false; }
+    return true;
+  }
+
+  async forcePushToRemote(): Promise<void> {
+    if (!this.guardForce()) return;
+    this.forceSyncInProgress = true;
+    this.setStatus("force push…");
+    try {
+      const snapshots: LocalFileSnapshot[] = [];
+      for (const path of this.syncableLocalPaths()) {
+        snapshots.push({ path, hash: await this.engine.hashPath(path), type: classifyFileType(path), fileId: this.index.byPath(path)?.fileId });
+      }
+      const result = await this.buildForceRunner().forcePush(snapshots);
+      if (result.ok) new Notice(`Force push complete: ${result.created} created, ${result.updated} updated, ${result.deleted} deleted on the server.`);
+      else new Notice(`Force push blocked (${result.blocked})${result.message ? `: ${result.message}` : ""}.`);
+    } catch (error) {
+      new Notice(`Force push failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.forceSyncInProgress = false;
+      this.setStatus(this.settings.paused ? "paused" : "syncing");
+    }
+  }
+
+  async forcePullFromRemote(): Promise<void> {
+    if (!this.guardForce()) return;
+    this.forceSyncInProgress = true;
+    this.setStatus("force pull…");
+    try {
+      const result = await this.buildForceRunner().forcePull(this.syncableLocalPaths());
+      if (result.ok) new Notice(`Force pull complete: ${result.written} files written, ${result.trashed} local strays removed.`);
+      else new Notice(`Force pull blocked (${result.blocked}).`);
+    } catch (error) {
+      new Notice(`Force pull failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.forceSyncInProgress = false;
+      this.setStatus(this.settings.paused ? "paused" : "syncing");
+    }
+  }
 
   async configureContentEncryption(passphrase: string, enabled: boolean): Promise<void> {
     if (!enabled) {
