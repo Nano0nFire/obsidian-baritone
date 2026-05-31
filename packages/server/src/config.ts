@@ -26,6 +26,7 @@ const EnvSchema = z.object({
   YJS_HISTORY_GC_INTERVAL_MS: z.coerce.number().int().min(0).max(86_400_000).default(3_600_000),
   SHUTDOWN_TIMEOUT_MS: z.coerce.number().int().min(1000).max(120_000).default(15_000),
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  TRUST_PROXY: z.string().optional().transform((v) => v === 'true' || v === '1'),
 });
 
 export type ServerConfig = z.infer<typeof EnvSchema>;

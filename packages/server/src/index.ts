@@ -1,10 +1,13 @@
 import http from 'node:http';
+import { ErrorCode } from '@obsidian-sync/shared';
 import { loadConfig } from './config.js';
 import { PgDatabase, type Queryable } from './db/pool.js';
 import { migrate } from './db/migrate.js';
 import { PgOpDataStore } from './db/pg-op-store.js';
 import { PgAuthRepository } from './auth/pg-repository.js';
+import { AuthService } from './auth/service.js';
 import { TokenService } from './auth/tokens.js';
+import { createAuthRouter, type LoginCapable } from './http/auth-routes.js';
 import { BlobStore } from './blob/store.js';
 import { OpProcessor } from './engine/op-processor.js';
 import { ConflictService } from './engine/conflict.js';
@@ -14,7 +17,7 @@ import { PgYjsRoomStore } from './engine/yjs.js';
 import { YjsGcJob } from './engine/yjs-gc.js';
 import { RoomManager } from './engine/room-manager.js';
 import { SyncWebSocketServer } from './ws/server.js';
-import { FixedWindowRateLimiter } from './ws/rate-limit.js';
+import { FixedWindowRateLimiter, LoginRateLimiter } from './ws/rate-limit.js';
 import { createLogger, parseLogLevel, type Logger } from './log/logger.js';
 
 export interface ReadinessDependencies {
@@ -27,6 +30,9 @@ export interface ReadinessReport {
   checks: { database: boolean; websocket: boolean };
 }
 
+/** Async HTTP route handler; resolves `true` when it owned (responded to) the request. */
+export type AuthRouter = (req: http.IncomingMessage, res: http.ServerResponse) => Promise<boolean>;
+
 export async function checkReadiness(deps: ReadinessDependencies): Promise<ReadinessReport> {
   const checks = { database: false, websocket: deps.ws.isReady() };
   try {
@@ -38,7 +44,7 @@ export async function checkReadiness(deps: ReadinessDependencies): Promise<Readi
   return { ok: checks.database && checks.websocket, checks };
 }
 
-export function createHttpHandler(deps: ReadinessDependencies): http.RequestListener {
+export function createHttpHandler(deps: ReadinessDependencies & { authRouter?: AuthRouter }): http.RequestListener {
   return (req, res) => {
     const url = req.url?.split('?', 1)[0];
     if (url === '/healthz') {
@@ -47,6 +53,17 @@ export function createHttpHandler(deps: ReadinessDependencies): http.RequestList
     }
     if (url === '/readyz') {
       void checkReadiness(deps).then((report) => writeJson(res, report.ok ? 200 : 503, report));
+      return;
+    }
+    if (deps.authRouter) {
+      void deps
+        .authRouter(req, res)
+        .then((handled) => {
+          if (!handled && !res.headersSent) writeJson(res, 404, { error: 'not_found' });
+        })
+        .catch(() => {
+          if (!res.headersSent) writeJson(res, 500, { error: ErrorCode.INTERNAL });
+        });
       return;
     }
     writeJson(res, 404, { error: 'not_found' });
@@ -62,6 +79,19 @@ export async function startServer(): Promise<{ close(): Promise<void> }> {
   const data = new PgOpDataStore(db);
   const authRepo = new PgAuthRepository(db);
   const tokens = new TokenService(config.JWT_SECRET, authRepo);
+  const loginLimiter = new LoginRateLimiter({
+    maxFailures: config.AUTH_RATE_LIMIT_MAX_FAILURES,
+    windowMs: config.AUTH_RATE_LIMIT_WINDOW_MS,
+    lockoutMs: config.AUTH_RATE_LIMIT_LOCKOUT_MS,
+  });
+  const authService: LoginCapable = new AuthService(authRepo, tokens, loginLimiter);
+  const authRouter = createAuthRouter(authService, { trustProxy: config.TRUST_PROXY });
+  if (!/^https:/i.test(config.PUBLIC_URL) && !/^https?:\/\/(localhost|127\.0\.0\.1)/i.test(config.PUBLIC_URL)) {
+    logger.warn('auth endpoint served over plain HTTP; credentials and tokens are not encrypted in transit', {
+      event: 'auth_insecure_transport',
+      publicUrl: config.PUBLIC_URL,
+    });
+  }
   const opProcessor = new OpProcessor(data);
   const blobStore = new BlobStore({ endpoint: config.S3_ENDPOINT, bucket: config.S3_BUCKET, accessKeyId: config.S3_ACCESS_KEY, secretAccessKey: config.S3_SECRET_KEY, region: config.S3_REGION }, data);
   const conflicts = new ConflictService(data);
@@ -78,7 +108,7 @@ export async function startServer(): Promise<{ close(): Promise<void> }> {
   const yjsGc = new YjsGcJob(yjsStore, { retainedVersionsPerFile: config.YJS_HISTORY_RETAINED_VERSIONS, intervalMs: config.YJS_HISTORY_GC_INTERVAL_MS, logger: logger.child({ component: 'yjs-gc' }) });
   yjsGc.start();
 
-  const server = http.createServer(createHttpHandler({ db, ws: { isReady: () => !closing && (wsRef.current?.isReady() ?? false) } }));
+  const server = http.createServer(createHttpHandler({ db, ws: { isReady: () => !closing && (wsRef.current?.isReady() ?? false) }, authRouter }));
   const ws = new SyncWebSocketServer(server, data, tokens, opProcessor, conflicts, manifest, trash, blobStore, rooms, {
     connectionLimiter: new FixedWindowRateLimiter({ max: config.WS_CONNECTION_RATE_LIMIT_MAX, windowMs: config.WS_CONNECTION_RATE_LIMIT_WINDOW_MS }),
     messageLimiterFactory: () => new FixedWindowRateLimiter({ max: config.WS_MESSAGE_RATE_LIMIT_MAX, windowMs: config.WS_MESSAGE_RATE_LIMIT_WINDOW_MS }),
