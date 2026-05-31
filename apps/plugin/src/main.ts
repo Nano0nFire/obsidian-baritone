@@ -21,6 +21,8 @@ import { ConflictPanel, VIEW_TYPE_CONFLICTS } from "./conflict/conflict-panel.js
 import { ManualChoiceModal, TextMergeModal, conflictResolvedVV } from "./conflict/merge-view.js";
 import { localConfigIgnorePatterns } from "./configsync/configsync.js";
 import type { VaultIO, VaultFileInfo } from "./sync/vault-io.js";
+import { SyncLogPanel, VIEW_TYPE_LOGS } from "./logs/log-panel.js";
+import { SyncLogStore, type SyncLogEntryInput, type SyncLogLevel } from "./logs/log-store.js";
 import {
   base64ToBytes,
   bytesToBase64,
@@ -150,6 +152,7 @@ class ObsidianVaultIO implements VaultIO {
 
 export default class ObsidianSyncPlugin extends Plugin {
   override settings: PluginSettings = DEFAULT_SETTINGS;
+  private readonly logStore = new SyncLogStore();
   private index!: LocalIndexStore;
   private transport!: SyncTransport;
   private engine!: SyncEngine;
@@ -170,10 +173,11 @@ export default class ObsidianSyncPlugin extends Plugin {
   override async onload(): Promise<void> {
     await this.loadSettings();
     await this.ensurePluginDir();
+    this.appendLog({ level: "info", source: "plugin", message: "Plugin loading" });
     const adapterStore = new ObsidianAdapterStore(this.app.vault.adapter);
     this.index = new LocalIndexStore(adapterStore, STATE_PATH, this.settings.deviceId);
     await this.index.load();
-    this.transport = new SyncTransport(this.settings.serverUrl);
+    this.transport = this.createTransport(this.settings.serverUrl);
     this.yjsManager = new YjsSessionManager(this.transport, {
       canPromote: () => !this.settings.contentEncryption.enabled,
       promoteDisabledReason: "Realtime collaboration is disabled while vault content encryption is enabled",
@@ -184,9 +188,22 @@ export default class ObsidianSyncPlugin extends Plugin {
     const vaultIO = new ObsidianVaultIO(this);
     this.vaultIO = vaultIO;
     this.engine = new SyncEngine(this.settings, this.index, vaultIO, this.transport, {
-      onState: (state, detail) => this.setStatus(detail ? `${state}: ${detail}` : state),
-      onConflict: (conflict) => { this.conflictStore.upsert(conflict); new Notice("Sync conflict requires manual resolution"); },
-      onError: (error) => new Notice(`Sync error: ${error.message}`),
+      onState: (state, detail) => {
+        this.setStatus(detail ? `${state}: ${detail}` : state);
+        this.appendLog({ level: state === "error" ? "error" : "info", source: "engine", message: detail ? `${state}: ${detail}` : state });
+      },
+      onConflict: (conflict) => {
+        this.conflictStore.upsert(conflict);
+        this.appendLog({ level: "warn", source: "conflict", message: `${conflict.kind} conflict ${conflict.conflictId} requires manual resolution` });
+        new Notice("Sync conflict requires manual resolution");
+      },
+      onError: (error) => {
+        this.appendLog({ level: "error", source: "engine", message: error.message });
+        new Notice(`Sync error: ${error.message}`);
+      },
+      onReject: (opId, code, message) => {
+        this.appendLog({ level: "warn", source: "engine", message: `Server rejected ${opId}: ${code} — ${message}` });
+      },
     }, this.yjsManager, () => this.contentEncryptionKey);
     const ignore = new SyncIgnore({ common: parseIgnoreLines(this.settings.commonIgnore), local: [...parseIgnoreLines(this.settings.localIgnore), ...localConfigIgnorePatterns(this.settings)] });
     this.ignore = ignore;
@@ -198,15 +215,23 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.renderPresence([]);
     this.addSettingTab(new ObsidianSyncSettingTab(this.app, this));
     this.registerView(VIEW_TYPE_CONFLICTS, (leaf) => new ConflictPanel(leaf, this.conflictStore, this.transport, (conflict) => void this.openMerge(conflict)));
+    this.registerView(VIEW_TYPE_LOGS, (leaf) => new SyncLogPanel(leaf, this.logStore));
     this.registerEditorExtension(this.yjsEditorExtensions);
     this.registerCommands();
     this.registerVaultEvents();
     if (this.settings.contentEncryption.enabled && !this.contentEncryptionKey) new Notice("Vault content encryption is enabled. Enter the passphrase in sync settings before syncing content.");
     this.engine.start();
+    this.appendLog({ level: "info", source: "plugin", message: "Sync engine started" });
     if (this.settings.syncOnStartup && !this.settings.paused) {
       if (this.index.device.appliedSeq === 0 && this.index.files.length === 0) {
+        this.appendLog({ level: "info", source: "initial-sync", message: "Initial sync started" });
         void new InitialSyncRunner(this.transport, this.index, vaultIO, this.settings.vaultId, () => this.contentEncryptionKey).run()
-          .catch((error: unknown) => new Notice(`Initial sync failed: ${error instanceof Error ? error.message : String(error)}`));
+          .then(() => this.appendLog({ level: "info", source: "initial-sync", message: "Initial sync completed" }))
+          .catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error);
+            this.appendLog({ level: "error", source: "initial-sync", message: `Initial sync failed: ${message}` });
+            new Notice(`Initial sync failed: ${message}`);
+          });
       } else {
         await this.watcher.reconcile();
       }
@@ -246,15 +271,22 @@ export default class ObsidianSyncPlugin extends Plugin {
     if (!this.guardForce()) return;
     this.forceSyncInProgress = true;
     this.setStatus("force push…");
+    this.appendLog({ level: "warn", source: "force-sync", message: "Force push started (local → remote)" });
     try {
       const snapshots: LocalFileSnapshot[] = [];
       for (const path of this.syncableLocalPaths()) {
         snapshots.push({ path, hash: await this.engine.hashPath(path), type: classifyFileType(path), fileId: this.index.byPath(path)?.fileId });
       }
       const result = await this.buildForceRunner().forcePush(snapshots);
-      if (result.ok) new Notice(`Force push complete: ${result.created} created, ${result.updated} updated, ${result.deleted} deleted on the server.`);
-      else new Notice(`Force push blocked (${result.blocked})${result.message ? `: ${result.message}` : ""}.`);
+      if (result.ok) {
+        this.appendLog({ level: "warn", source: "force-sync", message: `Force push complete: ${result.created} created, ${result.updated} updated, ${result.deleted} deleted on the server` });
+        new Notice(`Force push complete: ${result.created} created, ${result.updated} updated, ${result.deleted} deleted on the server.`);
+      } else {
+        this.appendLog({ level: "warn", source: "force-sync", message: `Force push blocked (${result.blocked})${result.message ? `: ${result.message}` : ""}` });
+        new Notice(`Force push blocked (${result.blocked})${result.message ? `: ${result.message}` : ""}.`);
+      }
     } catch (error) {
+      this.appendLog({ level: "error", source: "force-sync", message: `Force push failed: ${error instanceof Error ? error.message : String(error)}` });
       new Notice(`Force push failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       this.forceSyncInProgress = false;
@@ -266,11 +298,18 @@ export default class ObsidianSyncPlugin extends Plugin {
     if (!this.guardForce()) return;
     this.forceSyncInProgress = true;
     this.setStatus("force pull…");
+    this.appendLog({ level: "warn", source: "force-sync", message: "Force pull started (remote → local)" });
     try {
       const result = await this.buildForceRunner().forcePull(this.syncableLocalPaths());
-      if (result.ok) new Notice(`Force pull complete: ${result.written} files written, ${result.trashed} local strays removed.`);
-      else new Notice(`Force pull blocked (${result.blocked}).`);
+      if (result.ok) {
+        this.appendLog({ level: "warn", source: "force-sync", message: `Force pull complete: ${result.written} files written, ${result.trashed} local strays removed` });
+        new Notice(`Force pull complete: ${result.written} files written, ${result.trashed} local strays removed.`);
+      } else {
+        this.appendLog({ level: "warn", source: "force-sync", message: `Force pull blocked (${result.blocked})` });
+        new Notice(`Force pull blocked (${result.blocked}).`);
+      }
     } catch (error) {
+      this.appendLog({ level: "error", source: "force-sync", message: `Force pull failed: ${error instanceof Error ? error.message : String(error)}` });
       new Notice(`Force pull failed: ${error instanceof Error ? error.message : String(error)}`);
     } finally {
       this.forceSyncInProgress = false;
@@ -301,8 +340,17 @@ export default class ObsidianSyncPlugin extends Plugin {
   async saveSettingsAndRestart(): Promise<void> {
     await this.saveSettingsOnly();
     if (this.engine) await this.engine.stop();
-    this.transport = new SyncTransport(this.settings.serverUrl);
+    this.transport = this.createTransport(this.settings.serverUrl);
+    this.appendLog({ level: "info", source: "plugin", message: "Settings saved; restart required" });
     this.setStatus("restart required");
+  }
+
+  appendLog(entry: SyncLogEntryInput): void {
+    this.logStore.append(entry);
+  }
+
+  async openLogViewer(): Promise<void> {
+    await this.activateLogsView();
   }
 
   private async loadSettings(): Promise<void> { this.settings = mergeSettings(await this.loadData()); await this.saveSettingsOnly(); }
@@ -316,6 +364,7 @@ export default class ObsidianSyncPlugin extends Plugin {
   private registerCommands(): void {
     this.addCommand({ id: "resync", name: "Resync from server", callback: () => this.engine.requestResync() });
     this.addCommand({ id: "open-conflicts", name: "Open conflicts panel", callback: () => void this.activateConflictsView() });
+    this.addCommand({ id: "open-sync-log", name: "Open sync log", callback: () => void this.openLogViewer() });
     this.addCommand({ id: "show-version-history", name: "Show version history for current note", callback: () => void this.showCurrentNoteHistory() });
     this.addCommand({ id: "pause-resume", name: "Pause/resume sync", callback: async () => { this.settings.paused = !this.settings.paused; if (this.settings.paused) this.engine.pause(); else this.engine.resume(); await this.saveSettingsOnly(); } });
   }
@@ -434,6 +483,26 @@ export default class ObsidianSyncPlugin extends Plugin {
     if (!leaf) return;
     await leaf.setViewState({ type: VIEW_TYPE_CONFLICTS, active: true });
     this.app.workspace.revealLeaf(leaf);
+  }
+
+  private async activateLogsView(): Promise<void> {
+    const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_LOGS);
+    const leaf = leaves[0] ?? this.app.workspace.getRightLeaf(false);
+    if (!leaf) return;
+    await leaf.setViewState({ type: VIEW_TYPE_LOGS, active: true });
+    this.app.workspace.revealLeaf(leaf);
+  }
+
+  private createTransport(url: string): SyncTransport {
+    return new SyncTransport(url, undefined, {
+      onStateChange: (state) => {
+        const level: SyncLogLevel = state === "closed" ? "warn" : "info";
+        this.appendLog({ level, source: "transport", message: `WebSocket ${state}` });
+      },
+      onInvalidMessage: (error) => {
+        this.appendLog({ level: "error", source: "transport", message: `Dropped invalid server message: ${error.message}` });
+      },
+    });
   }
 
   private async openMerge(conflict: ConflictRecord): Promise<void> {

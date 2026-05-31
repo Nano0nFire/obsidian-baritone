@@ -65,6 +65,92 @@
   text-overflow: ellipsis;
 }
 
+.obsidian-sync-log-toolbar {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.obsidian-sync-log-toolbar h3 {
+  margin: 0;
+}
+
+.obsidian-sync-log-actions {
+  display: inline-flex;
+  gap: 8px;
+}
+
+.obsidian-sync-log-empty.is-hidden {
+  display: none;
+}
+
+.obsidian-sync-log-list {
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: calc(100vh - 180px);
+  overflow: auto;
+  padding: 10px;
+}
+
+.obsidian-sync-log-entry {
+  border-bottom: 1px solid var(--background-modifier-border);
+  padding-bottom: 8px;
+}
+
+.obsidian-sync-log-entry:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+
+.obsidian-sync-log-meta {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.obsidian-sync-log-time,
+.obsidian-sync-log-source {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.obsidian-sync-log-level {
+  border-radius: 999px;
+  font-size: var(--font-ui-smaller);
+  padding: 1px 8px;
+}
+
+.obsidian-sync-log-level.is-info {
+  background: var(--background-modifier-hover);
+}
+
+.obsidian-sync-log-level.is-warn {
+  background: var(--text-warning);
+  color: var(--text-on-accent);
+}
+
+.obsidian-sync-log-level.is-error {
+  background: var(--text-error);
+  color: var(--text-on-accent);
+}
+
+.obsidian-sync-log-level.is-debug {
+  background: var(--background-secondary-alt);
+}
+
+.obsidian-sync-log-message {
+  font-family: var(--font-monospace);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
 .cm-ySelection {
   border-radius: 2px;
 }

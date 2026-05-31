@@ -56,6 +56,7 @@ export interface EngineHooks {
   onState?(state: EngineState, detail?: string): void;
   onConflict?(conflict: ConflictRecord): void;
   onError?(error: Error): void;
+  onReject?(opId: string, code: string, message: string): void;
 }
 
 export class SyncEngine {
@@ -347,6 +348,7 @@ export class SyncEngine {
 
   private async handleReject(message: RejectMessage): Promise<void> {
     if (!message.opId) return;
+    this.hooks.onReject?.(message.opId, message.code, message.message);
     const waiter = this.forceWaiters.get(message.opId);
     if (waiter) {
       this.forceWaiters.delete(message.opId);

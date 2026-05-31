@@ -40,6 +40,7 @@ class LoginModal extends Modal {
   }
   private async login(): Promise<void> {
     try {
+      this.plugin.appendLog({ level: "info", source: "auth", message: `Login requested for ${this.username || "(empty username)"}` });
       const base = serverHttpBase(this.plugin.settings.serverUrl);
       const response = await requestUrlFetch(`${base}/auth/login`, {
         method: "POST",
@@ -53,10 +54,12 @@ class LoginModal extends Modal {
       this.plugin.settings.accessToken = data.accessToken;
       this.plugin.settings.refreshToken = data.refreshToken;
       if (data.deviceId) this.plugin.settings.deviceId = data.deviceId;
+      this.plugin.appendLog({ level: "info", source: "auth", message: `Login succeeded as ${this.username}` });
       await this.plugin.saveSettingsAndRestart();
       new Notice("Logged in");
       this.close();
     } catch (error) {
+      this.plugin.appendLog({ level: "error", source: "auth", message: `Login failed: ${error instanceof Error ? error.message : String(error)}` });
       new Notice(`Login failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
@@ -109,6 +112,10 @@ export class ObsidianSyncSettingTab extends PluginSettingTab {
     new Setting(containerEl).setName("Vault ID").addText((text) => text.setValue(this.plugin.settings.vaultId).onChange(async (value) => { this.plugin.settings.vaultId = value.trim() || "default"; await this.plugin.saveSettingsOnly(); }));
     new Setting(containerEl).setName("Device ID").setDesc(this.plugin.settings.deviceId).addButton((button) => button.setButtonText("Regenerate").onClick(async () => { this.plugin.settings.deviceId = crypto.randomUUID(); await this.plugin.saveSettingsAndRestart(); this.display(); }));
     new Setting(containerEl).setName("Login").setDesc(this.plugin.settings.username ? `Logged in as ${this.plugin.settings.username}` : "No credentials stored").addButton((button) => button.setButtonText("Login").setCta().onClick(() => new LoginModal(this.app, this.plugin).open()));
+    new Setting(containerEl)
+      .setName("Sync log")
+      .setDesc("Open the live sync log viewer to inspect connection, sync, and error events.")
+      .addButton((button) => button.setButtonText("Open log viewer").onClick(() => void this.plugin.openLogViewer()));
     new Setting(containerEl).setName("Remote deletes").setDesc("Where files deleted by remote ops are moved locally.").addDropdown((drop) => drop.addOption("obsidian-trash", "Obsidian .trash").addOption("system-trash", "System trash").setValue(this.plugin.settings.remoteDeleteTarget).onChange(async (value) => { this.plugin.settings.remoteDeleteTarget = value as typeof this.plugin.settings.remoteDeleteTarget; await this.plugin.saveSettingsOnly(); }));
     new Setting(containerEl)
       .setName("Vault content encryption")

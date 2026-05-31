@@ -7,15 +7,97 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function hasString(value: Record<string, unknown>, key: string): boolean {
+  return typeof value[key] === "string";
+}
+
+function hasNumber(value: Record<string, unknown>, key: string): boolean {
+  return typeof value[key] === "number";
+}
+
+function hasBoolean(value: Record<string, unknown>, key: string): boolean {
+  return typeof value[key] === "boolean";
+}
+
+function validateServerMessage(parsed: Record<string, unknown>): void {
+  switch (parsed.t) {
+    case "welcome":
+      if (!hasNumber(parsed, "serverTime") || !hasNumber(parsed, "currentSeq") || !hasNumber(parsed, "serverProtocol") || !hasNumber(parsed, "minClientProtocol") || !Array.isArray(parsed.capabilities)) throw new Error("Invalid welcome message");
+      return;
+    case "ops":
+      if (!Array.isArray(parsed.ops) || !hasBoolean(parsed, "more")) throw new Error("Invalid ops message");
+      return;
+    case "op_ack":
+      if (!hasString(parsed, "opId") || !hasNumber(parsed, "vaultSeq") || !isRecord(parsed.resultingClocks) || !hasNumber(parsed.resultingClocks, "epoch")) throw new Error("Invalid op_ack message");
+      return;
+    case "blob_upload_url":
+      if (!hasString(parsed, "hash") || !(parsed.url === null || typeof parsed.url === "string") || !hasBoolean(parsed, "alreadyExists")) throw new Error("Invalid blob_upload_url message");
+      return;
+    case "conflict":
+      if (!isRecord(parsed.conflict) || !hasString(parsed.conflict, "conflictId")) throw new Error("Invalid conflict message");
+      return;
+    case "conflict_state":
+      if (!hasString(parsed, "conflictId") || !hasString(parsed, "status")) throw new Error("Invalid conflict_state message");
+      return;
+    case "room_state":
+      if (!hasString(parsed, "fileId") || !hasNumber(parsed, "roomEpoch") || !hasString(parsed, "yjsSnapshot") || !hasString(parsed, "stateVector")) throw new Error("Invalid room_state message");
+      return;
+    case "yjs_update":
+      if (!hasString(parsed, "fileId") || !hasNumber(parsed, "roomEpoch") || !hasNumber(parsed, "seq") || !hasString(parsed, "update")) throw new Error("Invalid yjs_update message");
+      return;
+    case "yjs_ack":
+      if (!hasString(parsed, "fileId") || !hasNumber(parsed, "roomEpoch") || !hasNumber(parsed, "updateId") || !hasNumber(parsed, "seq")) throw new Error("Invalid yjs_ack message");
+      return;
+    case "yjs_awareness":
+      if (!hasString(parsed, "fileId") || !hasNumber(parsed, "roomEpoch") || !hasString(parsed, "from") || !hasString(parsed, "state")) throw new Error("Invalid yjs_awareness message");
+      return;
+    case "room_closed":
+      if (!hasString(parsed, "fileId") || !hasNumber(parsed, "roomEpoch") || !hasString(parsed, "reason")) throw new Error("Invalid room_closed message");
+      return;
+    case "manifest_page":
+      if (!hasNumber(parsed, "watermarkSeq") || !Array.isArray(parsed.items) || !(parsed.nextCursor === null || typeof parsed.nextCursor === "string")) throw new Error("Invalid manifest_page message");
+      return;
+    case "content":
+      if (!hasString(parsed, "hash") || !(parsed.data === null || typeof parsed.data === "string")) throw new Error("Invalid content message");
+      return;
+    case "trash_list":
+      if (!Array.isArray(parsed.items)) throw new Error("Invalid trash_list message");
+      return;
+    case "history_list":
+      if (!hasString(parsed, "requestId") || !hasString(parsed, "fileId") || !Array.isArray(parsed.versions) || !hasBoolean(parsed, "more")) throw new Error("Invalid history_list message");
+      return;
+    case "history_version":
+      if (!hasString(parsed, "requestId") || !hasString(parsed, "fileId") || !hasString(parsed, "versionId") || !hasString(parsed, "text")) throw new Error("Invalid history_version message");
+      return;
+    case "history_restored":
+      if (!hasString(parsed, "requestId") || !hasString(parsed, "fileId") || !hasString(parsed, "versionId") || !hasString(parsed, "text")) throw new Error("Invalid history_restored message");
+      return;
+    case "error":
+      if (!hasString(parsed, "code") || !hasString(parsed, "message")) throw new Error("Invalid error message");
+      return;
+    case "reject":
+      if (!hasString(parsed, "code") || !hasString(parsed, "message")) throw new Error("Invalid reject message");
+      return;
+    default:
+      throw new Error(`Unsupported server message type: ${String(parsed.t)}`);
+  }
+}
+
 export function parseServerMessage(raw: string): ServerMessage {
   const parsed = JSON.parse(raw) as unknown;
   if (!isRecord(parsed) || typeof parsed.t !== "string") throw new Error("Invalid server message envelope");
+  validateServerMessage(parsed);
   return parsed as unknown as ServerMessage;
 }
 
 export interface ReconnectOptions {
   minDelayMs: number;
   maxDelayMs: number;
+}
+
+export interface TransportHooks {
+  onStateChange?(state: TransportState): void;
+  onInvalidMessage?(error: Error, raw: string): void;
 }
 
 export class SyncTransport {
@@ -28,7 +110,11 @@ export class SyncTransport {
   private state: TransportState = "closed";
   private attempt = 0;
 
-  constructor(private readonly url: string, private readonly options: ReconnectOptions = { minDelayMs: 500, maxDelayMs: 30_000 }) {}
+  constructor(
+    private readonly url: string,
+    private readonly options: ReconnectOptions = { minDelayMs: 500, maxDelayMs: 30_000 },
+    private readonly hooks: TransportHooks = {},
+  ) {}
 
   get readyState(): TransportState { return this.state; }
 
@@ -60,6 +146,8 @@ export class SyncTransport {
         const msg = parseServerMessage(String(event.data));
         for (const listener of this.listeners) void listener(msg);
       } catch (error) {
+        const normalized = error instanceof Error ? error : new Error(String(error));
+        this.hooks.onInvalidMessage?.(normalized, String(event.data));
         console.error("obsidian-sync: dropped invalid server message", error);
       }
     };
@@ -117,7 +205,9 @@ export class SyncTransport {
   }
 
   private setState(state: TransportState): void {
+    if (this.state === state) return;
     this.state = state;
+    this.hooks.onStateChange?.(state);
     for (const listener of this.stateListeners) listener(state);
   }
 }
