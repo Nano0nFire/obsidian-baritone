@@ -26,6 +26,7 @@ import {
   type VersionVector,
 } from "@obsidian-sync/shared";
 import { BlobUploader } from "../blob/uploader.js";
+import type { FetchLike } from "../http-adapter.js";
 import type { PluginSettings } from "../settings.js";
 import type { LocalIndexStore } from "../localindex/index.js";
 import { OutboxManager, type FileOpDraft } from "./outbox.js";
@@ -77,9 +78,10 @@ export class SyncEngine {
     private readonly hooks: EngineHooks = {},
     private readonly yjs?: YjsSessionManager,
     private readonly contentKeyProvider: () => VaultContentKey | null = () => null,
+    private readonly blobFetch: FetchLike = fetch,
   ) {
     this.outbox = new OutboxManager(settings.deviceId, index.device.nextDeviceSeq, index.device.outbox);
-    this.blobUploader = new BlobUploader(transport);
+    this.blobUploader = new BlobUploader(transport, blobFetch);
   }
 
   start(): void {

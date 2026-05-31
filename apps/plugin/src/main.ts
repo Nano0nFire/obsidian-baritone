@@ -494,7 +494,7 @@ export default class ObsidianSyncPlugin extends Plugin {
         this.appendLog({ level: "warn", source: "engine", message: `Server rejected ${opId}: ${code} — ${message}` });
         if (this.shouldRefreshSession(code, message)) void this.refreshSession("server reject", `${code}: ${message}`);
       },
-    }, this.yjsManager, () => this.contentEncryptionKey);
+    }, this.yjsManager, () => this.contentEncryptionKey, requestUrlFetch);
     this.ignore = new SyncIgnore({ common: parseIgnoreLines(this.settings.commonIgnore), local: [...parseIgnoreLines(this.settings.localIgnore), ...localConfigIgnorePatterns(this.settings)] });
     this.watcher = new VaultWatcher(this.vaultIO, this.index, this.engine, this.ignore);
     if (this.settings.contentEncryption.enabled && !this.contentEncryptionKey) new Notice("Vault content encryption is enabled. Enter the passphrase in sync settings before syncing content.");
