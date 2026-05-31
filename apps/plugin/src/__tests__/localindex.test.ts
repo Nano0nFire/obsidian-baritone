@@ -31,6 +31,21 @@ class RenameNoOverwriteAdapter implements PluginAdapter {
   }
 }
 
+class RenameDeletesTempBeforeThrowingAdapter extends RenameNoOverwriteAdapter {
+  override async remove(path: string): Promise<void> {
+    if (!this.files.has(path)) throw new Error(`ENOENT: no such file or directory, unlink '${path}'`);
+    this.files.delete(path);
+  }
+
+  override async rename(oldPath: string, newPath: string): Promise<void> {
+    const value = this.files.get(oldPath);
+    if (value === undefined) throw new Error(`missing: ${oldPath}`);
+    this.files.delete(oldPath);
+    if (this.files.has(newPath)) throw new Error("Destination file already exist");
+    this.files.set(newPath, value);
+  }
+}
+
 describe("LocalIndexStore.save", () => {
   it("falls back when adapter rename cannot overwrite an existing state file", async () => {
     const adapter = new RenameNoOverwriteAdapter();
@@ -49,6 +64,27 @@ describe("LocalIndexStore.save", () => {
 
     expect(JSON.parse(adapter.files.get("state.json") ?? "{}")).toMatchObject({
       device: { appliedSeq: 9, deviceId: "device-1" },
+    });
+    expect(adapter.files.has("state.json.next")).toBe(false);
+  });
+
+  it("ignores missing temp-file cleanup when rename already removed the temp path", async () => {
+    const adapter = new RenameDeletesTempBeforeThrowingAdapter();
+    adapter.files.set("state.json", JSON.stringify({
+      schemaVersion: 1,
+      files: [],
+      device: { appliedSeq: 3, deviceId: "device-1", nextDeviceSeq: 4, outbox: [], downloadedHashes: [] },
+      conflicts: [],
+    }));
+
+    const store = new LocalIndexStore(adapter, "state.json", "device-1");
+    await store.load();
+    store.setAppliedSeq(11);
+
+    await expect(store.save()).resolves.toBeUndefined();
+
+    expect(JSON.parse(adapter.files.get("state.json") ?? "{}")).toMatchObject({
+      device: { appliedSeq: 11, deviceId: "device-1" },
     });
     expect(adapter.files.has("state.json.next")).toBe(false);
   });
