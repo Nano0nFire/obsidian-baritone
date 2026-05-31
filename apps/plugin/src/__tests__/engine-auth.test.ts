@@ -103,7 +103,9 @@ describe("SyncEngine auth handshake", () => {
       capabilities: [],
     });
 
-    expect(transport.latestFileOp()).toBeDefined();
+    const sent = transport.latestFileOp();
+    expect(sent).toBeDefined();
+    expect(sent).toMatchObject({ kind: "create", newPath: "note.md" });
     expect(yjs.handleTransportOpen).toHaveBeenCalledTimes(1);
   });
 
