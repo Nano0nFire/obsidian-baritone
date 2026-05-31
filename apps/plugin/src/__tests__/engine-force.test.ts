@@ -92,4 +92,20 @@ describe("SyncEngine force push", () => {
     expect(index.device.nextDeviceSeq).toBe(op.deviceSeq);
     expect(index.device.outbox).toHaveLength(0);
   });
+
+  it("does not rewind the deviceSeq when the server acks with a conflict (seq consumed)", async () => {
+    const transport = new FakeTransport();
+    const vault = new FakeVault();
+    const { engine, index } = makeEngine(transport, vault);
+
+    const draft = await engine.makeForcedContentOp("f1", "note.md", "note", {}, false);
+    const promise = engine.pushForced(draft);
+    const op = await transport.waitForOp();
+    await transport.deliver({ t: "op_ack", opId: op.opId, vaultSeq: 9, resultingClocks: { epoch: 0 }, conflictId: "c-1" });
+    const result = await promise;
+
+    expect(result.ok).toBe(false);
+    expect(index.device.nextDeviceSeq).toBe(op.deviceSeq + 1);
+    expect(index.device.outbox.some((entry) => entry.op.opId === op.opId)).toBe(true);
+  });
 });

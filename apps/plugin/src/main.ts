@@ -37,6 +37,7 @@ import {
 } from "@obsidian-sync/shared";
 
 const STATE_PATH = ".obsidian/plugins/obsidian-sync/state.json";
+const PLUGIN_PRIVATE_DIR = ".obsidian/plugins/obsidian-sync/";
 
 type AwarenessCursor = { anchor: Y.RelativePosition; head: Y.RelativePosition };
 
@@ -230,7 +231,7 @@ export default class ObsidianSyncPlugin extends Plugin {
   private syncableLocalPaths(): string[] {
     return this.vaultIO.listFiles()
       .map((file) => canonicalVaultPath(file.path))
-      .filter((path) => !this.ignore.ignores(path));
+      .filter((path) => !path.startsWith(PLUGIN_PRIVATE_DIR) && !this.ignore.ignores(path));
   }
 
   private guardForce(): boolean {

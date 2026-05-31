@@ -32,17 +32,19 @@ class FakeVault implements VaultIO {
 class FakeEngine implements ForceEngineLike {
   pushed: FileOpDraft[] = [];
   conflicts = false;
+  pending = 0;
   active = new Set<string>();
   rejectFor: string | null = null;
   hasConflicts(): boolean { return this.conflicts; }
+  outboxPendingCount(): number { return this.pending; }
   isRealtimeActiveFile(fileId: string): boolean { return this.active.has(fileId); }
   async makeForcedContentOp(fileId: string, path: string, type: string, dominateVV: Record<string, number>, remoteExists: boolean): Promise<FileOpDraft> {
     return { vaultId: "v", fileId, kind: remoteExists ? "update" : "create", type: type as ManifestEntry["type"], newPath: path, newContentVV: dominateVV, contentHash: "sha256:local-" + path } as FileOpDraft;
   }
   makeDeleteOp(fileId: string, type: string): FileOpDraft { return { vaultId: "v", fileId, kind: "delete", type: type as ManifestEntry["type"] } as FileOpDraft; }
-  async pushForced(draft: FileOpDraft): Promise<{ ok: boolean; message?: string }> {
+  async pushForced(draft: FileOpDraft): Promise<{ ok: boolean; consumed?: boolean; message?: string }> {
     this.pushed.push(draft);
-    if (this.rejectFor && draft.fileId === this.rejectFor) return { ok: false, message: "rejected" };
+    if (this.rejectFor && draft.fileId === this.rejectFor) return { ok: false, consumed: false, message: "rejected" };
     return { ok: true };
   }
   async discardUnsentOutbox(): Promise<{ discarded: number; blockedByInflight: boolean }> { return { discarded: 0, blockedByInflight: false }; }
@@ -86,6 +88,17 @@ describe("ForceSyncRunner.forcePush", () => {
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("expected block");
     expect(result.blocked).toBe("realtime-active");
+  });
+
+  it("blocks when there are pending unsynced outbox ops", async () => {
+    const engine = new FakeEngine();
+    engine.pending = 2;
+    const runner = new ForceSyncRunner(engine, new FakeManifest([]), makeIndex(), new FakeVault(), gate(), { remoteDeleteSystemTrash: false });
+    const result = await runner.forcePush([{ path: "a.md", hash: "h", type: "note", fileId: "f1" }]);
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected block");
+    expect(result.blocked).toBe("pending-outbox");
+    expect(engine.pushed).toHaveLength(0);
   });
 
   it("creates new, updates changed, deletes remote-only, and resumes the watcher", async () => {
@@ -144,6 +157,7 @@ describe("ForceSyncRunner.forcePull", () => {
     expect(index.device.downloadedHashes).toEqual([]);
     expect(vault.trashed).toEqual([{ path: "stray.md", system: true }]);
     expect(index.byFileId("f-stray")?.deleted).toBe(true);
+    expect(index.device.appliedSeq).toBe(42);
     expect(g.calls).toEqual(["suspend", "resume"]);
   });
 

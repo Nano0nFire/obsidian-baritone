@@ -37,6 +37,13 @@ import { shouldApplyConfigPath } from "../configsync/configsync.js";
 
 export type EngineState = "idle" | "paused" | "connecting" | "syncing" | "error";
 
+/** Outcome of a single serialized force op. `consumed` means the server assigned
+ * a vaultSeq to this deviceSeq (ack-with-conflict or an uncertain timeout), so it
+ * must NOT be rolled back/reused. */
+export interface ForcePushOpResult { ok: boolean; consumed?: boolean; message?: string }
+
+const FORCED_OP_TIMEOUT_MS = 30000;
+
 function decodeBase64(data: string): Uint8Array {
   if (typeof Buffer !== "undefined") return new Uint8Array(Buffer.from(data, "base64"));
   const binary = atob(data);
@@ -57,7 +64,7 @@ export class SyncEngine {
   private lamport = 0;
   private state: EngineState = "idle";
   private unsubscribe: Array<() => void> = [];
-  private readonly forceWaiters = new Map<string, (result: { ok: boolean; message?: string }) => void>();
+  private readonly forceWaiters = new Map<string, (result: ForcePushOpResult) => void>();
 
   constructor(
     private readonly settings: PluginSettings,
@@ -161,24 +168,36 @@ export class SyncEngine {
    * required to keep future edits dominating). On terminal failure the op is
    * rolled back to keep the deviceSeq stream gap-free.
    */
-  async pushForced(draft: FileOpDraft): Promise<{ ok: boolean; message?: string }> {
+  async pushForced(draft: FileOpDraft): Promise<ForcePushOpResult> {
     const op = this.outbox.enqueue(draft);
     await this.persistOutbox();
-    const result = await new Promise<{ ok: boolean; message?: string }>((resolve) => {
-      this.forceWaiters.set(op.opId, resolve);
-      if (this.transport.readyState === "open") {
-        this.outbox.markInflight(op.opId);
-        this.transport.send({ t: "file_op", op });
-      } else {
-        this.forceWaiters.delete(op.opId);
-        resolve({ ok: false, message: "transport not connected" });
+    const result = await new Promise<ForcePushOpResult>((resolve) => {
+      if (this.transport.readyState !== "open") {
+        resolve({ ok: false, consumed: false, message: "transport not connected" });
+        return;
       }
+      let settled = false;
+      const finish = (value: ForcePushOpResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.forceWaiters.delete(op.opId);
+        resolve(value);
+      };
+      const timer = setTimeout(() => finish({ ok: false, consumed: true, message: "timed out waiting for server acknowledgement" }), FORCED_OP_TIMEOUT_MS);
+      this.forceWaiters.set(op.opId, finish);
+      this.outbox.markInflight(op.opId);
+      this.transport.send({ t: "file_op", op });
     });
     if (result.ok) {
       this.applyForcedToIndex(op);
-    } else {
+    } else if (!result.consumed) {
+      // Server never accepted this seq — safe to rewind so the stream stays gap-free.
       if (!this.outbox.rollbackLast(op.opId)) this.outbox.reject(op.opId, result.message ?? "rejected", true);
     }
+    // When consumed (ack-with-conflict or uncertain timeout) the entry is left
+    // as-is (conflicted/inflight) so the deviceSeq the server already consumed
+    // is not reused; normal sync recovery handles it on reconnect.
     await this.persistOutbox();
     return result;
   }
@@ -213,6 +232,9 @@ export class SyncEngine {
   }
 
   hasConflicts(): boolean { return this.index.data.conflicts.length > 0; }
+
+  /** Number of outbox ops not yet acked (queued/inflight/conflicted/rejected). */
+  outboxPendingCount(): number { return this.outbox.entries.length; }
 
   async hashPath(path: string): Promise<string> {
     if (!this.isEncryptionEnabled()) {
@@ -319,7 +341,7 @@ export class SyncEngine {
     const waiter = this.forceWaiters.get(message.opId);
     if (waiter) {
       this.forceWaiters.delete(message.opId);
-      waiter(message.conflictId ? { ok: false, message: `conflict ${message.conflictId}` } : { ok: true });
+      waiter(message.conflictId ? { ok: false, consumed: true, message: `conflict ${message.conflictId}` } : { ok: true });
     }
   }
 
@@ -328,7 +350,7 @@ export class SyncEngine {
     const waiter = this.forceWaiters.get(message.opId);
     if (waiter) {
       this.forceWaiters.delete(message.opId);
-      waiter({ ok: false, message: `${message.code}: ${message.message}` });
+      waiter({ ok: false, consumed: false, message: `${message.code}: ${message.message}` });
       return;
     }
     if (message.code === ErrorCode.SEQ_GAP || message.code === ErrorCode.STALE) {

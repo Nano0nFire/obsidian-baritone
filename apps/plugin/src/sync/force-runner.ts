@@ -1,4 +1,4 @@
-import type { FileType, ManifestEntry, VersionVector } from "@obsidian-sync/shared";
+import { caseFoldPath, type FileType, type ManifestEntry, type VersionVector } from "@obsidian-sync/shared";
 import type { LocalIndexStore } from "../localindex/index.js";
 import type { VaultIO } from "./vault-io.js";
 import type { FileOpDraft } from "./outbox.js";
@@ -8,9 +8,10 @@ import { planForcePush, planForcePullStrays, type LocalFileSnapshot, type Remote
 export interface ForceEngineLike {
   hasConflicts(): boolean;
   isRealtimeActiveFile(fileId: string): boolean;
+  outboxPendingCount(): number;
   makeForcedContentOp(fileId: string, path: string, type: FileType, dominateVV: VersionVector, remoteExists: boolean): Promise<FileOpDraft>;
   makeDeleteOp(fileId: string, type: FileType): FileOpDraft;
-  pushForced(draft: FileOpDraft): Promise<{ ok: boolean; message?: string }>;
+  pushForced(draft: FileOpDraft): Promise<{ ok: boolean; consumed?: boolean; message?: string }>;
   discardUnsentOutbox(): Promise<{ discarded: number; blockedByInflight: boolean }>;
 }
 
@@ -31,7 +32,7 @@ export interface ForceRunnerOptions {
 
 export type ForcePushResult =
   | { ok: true; created: number; updated: number; deleted: number; adopted: number }
-  | { ok: false; blocked: "conflicts" | "realtime-active" | "rejected"; message?: string };
+  | { ok: false; blocked: "conflicts" | "realtime-active" | "pending-outbox" | "rejected"; message?: string };
 
 export type ForcePullResult =
   | { ok: true; written: number; trashed: number }
@@ -65,6 +66,7 @@ export class ForceSyncRunner {
   /** Overwrite the remote vault so it mirrors the local vault. */
   async forcePush(local: readonly LocalFileSnapshot[]): Promise<ForcePushResult> {
     if (this.engine.hasConflicts()) return { ok: false, blocked: "conflicts" };
+    if (this.engine.outboxPendingCount() > 0) return { ok: false, blocked: "pending-outbox" };
     for (const file of local) {
       if (file.fileId && this.engine.isRealtimeActiveFile(file.fileId)) return { ok: false, blocked: "realtime-active" };
     }
@@ -72,12 +74,12 @@ export class ForceSyncRunner {
     try {
       const { entries } = await this.manifest.fetchManifest();
       const remote = toRemoteSnapshots(entries);
-      const remoteByPath = new Map(remote.map((entry) => [entry.path, entry] as const));
+      const remoteByPath = new Map(remote.map((entry) => [caseFoldPath(entry.path), entry] as const));
       const plan = planForcePush(local, remote, newFileId);
 
       let adopted = 0;
       for (const adoption of plan.adoptions) {
-        const match = remoteByPath.get(adoption.path);
+        const match = remoteByPath.get(caseFoldPath(adoption.path));
         if (!match) continue;
         if (adoption.oldFileId) this.index.removeFileId(adoption.oldFileId);
         this.index.upsertFile({
@@ -131,7 +133,7 @@ export class ForceSyncRunner {
       this.index.device.manifestCursor = null;
       await this.index.save();
 
-      const { entries } = await this.manifest.fetchManifest();
+      const { entries, watermarkSeq } = await this.manifest.fetchManifest();
       let written = 0;
       for (const entry of entries) {
         if (entry.deleted) continue;
@@ -148,6 +150,10 @@ export class ForceSyncRunner {
         if (entry) this.index.markDeleted(entry.fileId);
         trashed += 1;
       }
+      // Adopt the manifest watermark as our applied position so the engine does
+      // not replay historical ops back over the freshly materialized baseline.
+      this.index.setAppliedSeq(watermarkSeq);
+      this.index.device.manifestCursor = null;
       await this.index.save();
       return { ok: true, written, trashed };
     } finally {
