@@ -2,6 +2,7 @@ import { App, Modal, Notice, PluginSettingTab, Setting } from "obsidian";
 import type ObsidianSyncPlugin from "./main.js";
 import { CONFIG_CATEGORIES, type ConfigSyncMode } from "./settings.js";
 import { checkServerConnection, serverHttpBase } from "./connection.js";
+import { requestUrlFetch } from "./http.js";
 
 class EncryptionPassphraseModal extends Modal {
   private passphrase = "";
@@ -40,12 +41,12 @@ class LoginModal extends Modal {
   private async login(): Promise<void> {
     try {
       const base = serverHttpBase(this.plugin.settings.serverUrl);
-      const response = await fetch(`${base}/auth/login`, {
+      const response = await requestUrlFetch(`${base}/auth/login`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ username: this.username, password: this.password, deviceId: this.plugin.settings.deviceId, vaultId: this.plugin.settings.vaultId }),
       });
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = await response.json() as { accessToken?: string; refreshToken?: string; deviceId?: string };
       if (!data.accessToken || !data.refreshToken) throw new Error("Login response missing tokens");
       this.plugin.settings.username = this.username;
@@ -78,7 +79,7 @@ export class ObsidianSyncSettingTab extends PluginSettingTab {
           const original = button.buttonEl.textContent ?? "Test connection";
           button.setButtonText("Testing…").setDisabled(true);
           try {
-            const result = await checkServerConnection(this.plugin.settings.serverUrl);
+            const result = await checkServerConnection(this.plugin.settings.serverUrl, requestUrlFetch);
             if (result.ok) {
               new Notice(`Connection OK — database: ${result.database ? "up" : "down"}, websocket: ${result.websocket ? "up" : "down"}`);
             } else {

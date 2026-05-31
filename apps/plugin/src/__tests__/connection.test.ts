@@ -49,4 +49,17 @@ describe("checkServerConnection", () => {
     const result = await checkServerConnection("http://localhost:3000", fetchImpl as unknown as typeof fetch);
     expect(result).toEqual({ ok: false, reason: "Failed to fetch" });
   });
+
+  it("times out even when the request implementation ignores the abort signal", async () => {
+    // Obsidian's requestUrl cannot be aborted, so the timeout must be enforced
+    // by checkServerConnection itself rather than relying on the abort signal.
+    const fetchImpl = vi.fn(() => new Promise<Response>(() => {}));
+    const result = await checkServerConnection(
+      "http://localhost:3000",
+      fetchImpl as unknown as typeof fetch,
+      20,
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/timed out/i);
+  });
 });

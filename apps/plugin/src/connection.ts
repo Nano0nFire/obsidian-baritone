@@ -1,4 +1,6 @@
 /** Convert the configured WebSocket sync URL into the server's HTTP base URL. */
+import type { FetchLike } from "./http-adapter.js";
+
 export function serverHttpBase(serverUrl: string): string {
   const trimmed = serverUrl.trim();
   const asHttp = trimmed.startsWith("ws://")
@@ -25,7 +27,7 @@ interface ReadyzBody {
  */
 export async function checkServerConnection(
   serverUrl: string,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl: FetchLike = fetch,
   timeoutMs = 8000,
 ): Promise<ConnectionResult> {
   if (serverUrl.trim() === "") {
@@ -33,10 +35,23 @@ export async function checkServerConnection(
   }
   const url = `${serverHttpBase(serverUrl)}/readyz`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  let response: Response;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // Enforce the timeout via a race rather than relying solely on the abort
+  // signal: Obsidian's requestUrl-backed fetch cannot be aborted.
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      const error = new Error(`Timed out after ${timeoutMs} ms`);
+      error.name = "AbortError";
+      reject(error);
+    }, timeoutMs);
+  });
+  let response: { ok: boolean; status: number; json(): Promise<unknown> };
   try {
-    response = await fetchImpl(url, { method: "GET", signal: controller.signal });
+    response = await Promise.race([
+      fetchImpl(url, { method: "GET", signal: controller.signal }),
+      timeout,
+    ]);
   } catch (error) {
     const reason =
       error instanceof Error

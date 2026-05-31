@@ -1,6 +1,6 @@
 {
   "name": "obsidian-sync-plugin",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Obsidian client for self-hosted real-time vault sync",
   "type": "module",
   "scripts": {
