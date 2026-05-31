@@ -124,7 +124,7 @@ export class SyncEngine {
     const base = entry?.appliedContentVV ?? {};
     const next = bump(base, this.settings.deviceId);
     const payload = await this.buildContentPayload(fileId, path, textOrBytes);
-    return { vaultId: this.settings.vaultId, fileId, kind: entry ? "update" : "create", type, baseContentVV: base, newContentVV: next, ...payload };
+    return { vaultId: this.settings.vaultId, fileId, kind: entry ? "update" : "create", type, newPath: path, baseContentVV: base, newContentVV: next, ...payload };
   }
 
   private async buildContentPayload(fileId: string, path: string, textOrBytes?: string | Uint8Array): Promise<Pick<FileOpDraft, "contentHash" | "size" | "inlineText" | "blobRef" | "contentEncoding">> {
