@@ -41,6 +41,10 @@ export interface PluginAdapter {
   mkdir?(path: string): Promise<void>;
 }
 
+function isDestinationExistsError(error: unknown): boolean {
+  return error instanceof Error && /destination file already exist/i.test(error.message);
+}
+
 function defaultSnapshot(deviceId: string): LocalIndexSnapshot {
   return {
     schemaVersion: 1,
@@ -90,11 +94,19 @@ export class LocalIndexStore {
     const text = `${JSON.stringify(this.snapshot, null, 2)}\n`;
     await this.adapter.write(tmp, text);
     if (this.adapter.rename) {
-      await this.adapter.rename(tmp, this.path);
+      try {
+        await this.adapter.rename(tmp, this.path);
+        return;
+      } catch (error) {
+        if (!isDestinationExistsError(error)) throw error;
+      }
     } else {
       await this.adapter.write(this.path, text);
       if (this.adapter.remove) await this.adapter.remove(tmp);
+      return;
     }
+    await this.adapter.write(this.path, text);
+    if (this.adapter.remove) await this.adapter.remove(tmp);
   }
 
   upsertFile(entry: Omit<FileIndexEntry, "pathNormalized"> & Partial<Pick<FileIndexEntry, "pathNormalized">>): void {
