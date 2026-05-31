@@ -3,6 +3,12 @@ import type { Role } from '../engine/store.js';
 import type { AuthRepository } from './service.js';
 import type { RefreshTokenRecord, TokenRepository } from './tokens.js';
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isUuid(value: string): boolean {
+  return UUID_RE.test(value);
+}
+
 export class PgAuthRepository implements AuthRepository, TokenRepository {
   constructor(private readonly db: Queryable) {}
 
@@ -24,6 +30,7 @@ export class PgAuthRepository implements AuthRepository, TokenRepository {
     await this.db.query('INSERT INTO vault_members(vault_id,user_id,role) VALUES($1,$2,$3) ON CONFLICT(vault_id,user_id) DO UPDATE SET role=EXCLUDED.role', [vaultId, userId, role]);
   }
   async getMember(vaultId: string, userId: string) {
+    if (!isUuid(vaultId) || !isUuid(userId)) return null;
     const res = await this.db.query<{ role: Role }>('SELECT role FROM vault_members WHERE vault_id=$1 AND user_id=$2', [vaultId, userId]);
     return res.rows[0] ?? null;
   }
@@ -32,6 +39,7 @@ export class PgAuthRepository implements AuthRepository, TokenRepository {
     return { deviceId: res.rows[0]!.device_id };
   }
   async getDevice(deviceId: string) {
+    if (!isUuid(deviceId)) return null;
     const res = await this.db.query<{ device_id: string; user_id: string; vault_id: string; revoked: boolean }>('SELECT device_id,user_id,vault_id,revoked FROM devices WHERE device_id=$1', [deviceId]);
     const r = res.rows[0];
     return r ? { deviceId: r.device_id, userId: r.user_id, vaultId: r.vault_id, revoked: r.revoked } : null;
